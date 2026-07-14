@@ -323,8 +323,16 @@ button {
   background: rgba(0, 0, 0, 0.16);
 }
 
+.source-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(54px, 1fr));
+  align-items: stretch;
+  gap: 3px;
+}
+
 .source-tab,
 .segment-button {
+  box-sizing: border-box;
   min-height: 29px;
   padding: 0 10px;
   border: 0;
@@ -334,6 +342,20 @@ button {
   cursor: pointer;
   font-size: 11px;
   transition: 160ms ease;
+}
+
+.source-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 29px;
+  min-height: 29px;
+  margin: 0;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .source-tab:hover,
@@ -880,8 +902,44 @@ button {
   margin-top: 12px;
 }
 
-.upload-button input {
+.source-file-input {
   display: none;
+}
+
+.ruler-console {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid rgba(255, 199, 102, 0.3);
+  border-radius: 10px;
+  background: rgba(255, 199, 102, 0.055);
+}
+
+.ruler-readout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ruler-readout > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: #ffd27d;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.ruler-readout small {
+  color: var(--faint);
+  font-family: Arial, Helvetica, "PingFang SC", sans-serif;
+  font-size: 8px;
+}
+
+.ruler-confidence {
+  color: var(--amber);
+  font-size: 9px;
 }
 
 .notice {

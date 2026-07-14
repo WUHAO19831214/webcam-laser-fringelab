@@ -29,6 +29,8 @@ test("server-renders the finished FringeLab experiment bench", async () => {
   assert.match(html, /峰值≤98%/);
   assert.match(html, /理想模型拟合/);
   assert.match(html, /拖动四角方块调整长宽/);
+  assert.match(html, /标尺套合/);
+  assert.match(html, /标尺实际区间/);
   assert.match(html, /双缝干涉/);
   assert.match(html, /单缝衍射/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);

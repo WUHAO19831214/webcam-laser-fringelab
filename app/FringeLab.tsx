@@ -54,16 +54,33 @@ import {
   type RoiCorner,
   type RoiGeometry,
 } from "@/lib/roi";
+import {
+  calculateCalibrationUncertaintyPct as rulerUncertaintyPct,
+  calculateMmPerPixel as rulerMmPerPixel,
+  generateRulerTicks,
+  hitTestRuler,
+  moveRuler,
+  resizeRulerEndpoint,
+  rulerAngleDeg,
+  rulerLengthPx,
+  suggestRulerAlignment,
+  type RulerCalibration,
+} from "@/lib/ruler";
 
 type SourceMode = "simulator" | "camera" | "image";
 type ExperimentMode = "double" | "single";
 type Level = "good" | "warn" | "danger";
+type SpatialCalibrationSource = "manual" | "two-point" | "ruler-fit";
 
 type Roi = RoiGeometry;
 
 type RoiInteraction =
   | { mode: "move"; startPoint: Point; startRoi: Roi }
   | { mode: "resize"; corner: RoiCorner; startRoi: Roi };
+
+type RulerInteraction =
+  | { mode: "move"; startPoint: Point; startRuler: RulerCalibration }
+  | { mode: "resize"; handle: "start" | "end"; startRuler: RulerCalibration };
 
 type Mark = DetectedExtremum & {
   axisPx: number;
@@ -122,12 +139,18 @@ const ROI_MIN_HEIGHT = 24;
 const ROI_MAX_WIDTH = 930;
 const ROI_MAX_HEIGHT = 420;
 const ROI_HANDLE_HIT_RADIUS = 18;
+const MIN_RULER_LENGTH_PX = 80;
 const DEFAULT_ROI: Roi = {
   centerX: FRAME_WIDTH / 2,
   centerY: FRAME_HEIGHT / 2,
   width: 820,
   height: 116,
   angleDeg: 0,
+};
+const DEFAULT_RULER: RulerCalibration = {
+  start: { x: 180, y: 430 },
+  end: { x: 780, y: 430 },
+  knownLengthMm: 50,
 };
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -552,11 +575,13 @@ export default function FringeLab() {
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const chartCanvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const lastFrameRef = useRef(0);
   const roiInteractionRef = useRef<RoiInteraction | null>(null);
+  const rulerInteractionRef = useRef<RulerInteraction | null>(null);
 
   const [sourceMode, setSourceMode] = useState<SourceMode>("simulator");
   const [experiment, setExperiment] = useState<ExperimentMode>("double");
@@ -586,8 +611,12 @@ export default function FringeLab() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isFrozen, setIsFrozen] = useState(false);
   const [calibrationMode, setCalibrationMode] = useState(false);
-  const [calibrationLengthMm, setCalibrationLengthMm] = useState(10);
   const [calibrationPoints, setCalibrationPoints] = useState<Array<{ x: number; y: number }>>([]);
+  const [ruler, setRuler] = useState<RulerCalibration>(DEFAULT_RULER);
+  const [rulerMode, setRulerMode] = useState(false);
+  const [calibrationSource, setCalibrationSource] = useState<SpatialCalibrationSource>("manual");
+  const [calibrationStale, setCalibrationStale] = useState(false);
+  const [rulerFitConfidence, setRulerFitConfidence] = useState<number | null>(null);
   const [showModelFit, setShowModelFit] = useState(true);
   const [toast, setToast] = useState("");
 
@@ -790,7 +819,72 @@ export default function FringeLab() {
       });
       context.restore();
     }
-  }, [roi, calibrationPoints]);
+
+    if (rulerMode) {
+      const length = rulerLengthPx(ruler);
+      const angleRadians = rulerAngleDeg(ruler) * Math.PI / 180;
+      const ticks = generateRulerTicks(ruler);
+      const scale = rulerMmPerPixel(ruler);
+      context.save();
+      context.translate(ruler.start.x, ruler.start.y);
+      context.rotate(angleRadians);
+      context.fillStyle = "rgba(255, 199, 102, .13)";
+      context.strokeStyle = "rgba(255, 199, 102, .95)";
+      context.lineWidth = 1.5;
+      context.fillRect(0, -38, length, 40);
+      context.strokeRect(0, -38, length, 40);
+      context.beginPath();
+      context.moveTo(0, 0);
+      context.lineTo(length, 0);
+      context.stroke();
+      context.font = "bold 9px monospace";
+      context.textAlign = "center";
+      context.fillStyle = "#ffd27d";
+      for (const tick of ticks) {
+        const x = Math.hypot(tick.point.x - ruler.start.x, tick.point.y - ruler.start.y);
+        const height = tick.kind === "major" ? 24 : tick.kind === "medium" ? 16 : 9;
+        context.beginPath();
+        context.moveTo(x, 0);
+        context.lineTo(x, -height);
+        context.stroke();
+        if (tick.kind === "major") context.fillText(String(tick.millimetre), x, -27);
+      }
+      context.restore();
+
+      for (const point of [ruler.start, ruler.end]) {
+        context.beginPath();
+        context.arc(point.x, point.y, 9, 0, Math.PI * 2);
+        context.fillStyle = "rgba(5, 13, 20, .95)";
+        context.fill();
+        context.lineWidth = 3;
+        context.strokeStyle = "#ffc766";
+        context.stroke();
+        context.beginPath();
+        context.arc(point.x, point.y, 3, 0, Math.PI * 2);
+        context.fillStyle = "#ffc766";
+        context.fill();
+      }
+
+      const midpoint = {
+        x: (ruler.start.x + ruler.end.x) / 2,
+        y: (ruler.start.y + ruler.end.y) / 2,
+      };
+      const summary = `${ruler.knownLengthMm.toFixed(1)} mm · ${length.toFixed(1)} px · ${scale?.toFixed(5) ?? "—"} mm/px`;
+      context.font = "bold 11px monospace";
+      context.textAlign = "center";
+      const summaryWidth = context.measureText(summary).width + 18;
+      const labelY = clamp(midpoint.y + 34, 22, FRAME_HEIGHT - 8);
+      context.fillStyle = "rgba(5, 13, 20, .9)";
+      context.fillRect(
+        clamp(midpoint.x - summaryWidth / 2, 4, FRAME_WIDTH - summaryWidth - 4),
+        labelY - 16,
+        summaryWidth,
+        22,
+      );
+      context.fillStyle = "#ffd27d";
+      context.fillText(summary, clamp(midpoint.x, summaryWidth / 2 + 4, FRAME_WIDTH - summaryWidth / 2 - 4), labelY);
+    }
+  }, [roi, calibrationPoints, ruler, rulerMode]);
 
   useEffect(() => {
     const canvas = chartCanvasRef.current;
@@ -876,12 +970,21 @@ export default function FringeLab() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const invalidateRulerCalibrationForNewSource = () => {
+    if (calibrationSource === "ruler-fit") setCalibrationStale(true);
+    setRulerMode(false);
+    setCalibrationMode(false);
+    setCalibrationPoints([]);
+    setRulerFitConfidence(null);
+  };
+
   const startCamera = async () => {
     setCameraError(null);
     setCameraLocked(false);
     try {
       closeCamera(streamRef.current);
       const result = await openCamera(selectedDeviceId || undefined);
+      invalidateRulerCalibrationForNewSource();
       streamRef.current = result.stream;
       setCameraSnapshot(result.snapshot);
       setSourceMode("camera");
@@ -897,6 +1000,7 @@ export default function FringeLab() {
   };
 
   const stopCamera = () => {
+    if (sourceMode !== "simulator") invalidateRulerCalibrationForNewSource();
     closeCamera(streamRef.current);
     streamRef.current = null;
     setCameraSnapshot(null);
@@ -925,9 +1029,11 @@ export default function FringeLab() {
   const handleImageUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     if (!file) return;
+    event.currentTarget.value = "";
     const url = URL.createObjectURL(file);
     const image = new Image();
     image.onload = () => {
+      invalidateRulerCalibrationForNewSource();
       closeCamera(streamRef.current);
       streamRef.current = null;
       setCameraSnapshot(null);
@@ -971,6 +1077,13 @@ export default function FringeLab() {
   };
 
   const updateOverlayCursor = (canvas: HTMLCanvasElement, point: Point) => {
+    if (rulerMode) {
+      const handle = hitTestRuler(ruler, point);
+      canvas.style.cursor = handle === "body"
+        ? "move"
+        : handle === "start" || handle === "end" ? "crosshair" : "default";
+      return;
+    }
     const corner = hitTestRoiCorner(roi, point, ROI_HANDLE_HIT_RADIUS);
     canvas.style.cursor = corner
       ? roiCornerCursor(corner)
@@ -986,10 +1099,23 @@ export default function FringeLab() {
       if (next.length === 2) {
         const pixelDistance = Math.hypot(next[1].x - next[0].x, next[1].y - next[0].y);
         if (pixelDistance > 1) {
-          setMmPerPixel(calibrationLengthMm / pixelDistance);
+          setMmPerPixel(ruler.knownLengthMm / pixelDistance);
+          setCalibrationSource("two-point");
+          setCalibrationStale(false);
           setCalibrationMode(false);
-          setToast(`标定完成：${(calibrationLengthMm / pixelDistance).toFixed(5)} mm/px`);
+          setToast(`标定完成：${(ruler.knownLengthMm / pixelDistance).toFixed(5)} mm/px`);
         }
+      }
+      return;
+    }
+    if (rulerMode) {
+      const handle = hitTestRuler(ruler, point);
+      if (handle === "body") {
+        rulerInteractionRef.current = { mode: "move", startPoint: point, startRuler: ruler };
+        event.currentTarget.style.cursor = "grabbing";
+      } else if (handle === "start" || handle === "end") {
+        rulerInteractionRef.current = { mode: "resize", handle, startRuler: ruler };
+        event.currentTarget.style.cursor = "crosshair";
       }
       return;
     }
@@ -1016,6 +1142,13 @@ export default function FringeLab() {
     const offset = movement[event.key];
     if (!offset) return;
     event.preventDefault();
+    if (rulerMode) {
+      setRuler((previous) => moveRuler(previous, offset[0], offset[1], {
+        width: FRAME_WIDTH,
+        height: FRAME_HEIGHT,
+      }));
+      return;
+    }
     setRoi((previous) => ({
       ...previous,
       centerX: clamp(previous.centerX + offset[0], 0, FRAME_WIDTH),
@@ -1026,6 +1159,33 @@ export default function FringeLab() {
   const handlePointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (calibrationMode) return;
     const point = pointerPosition(event);
+    if (rulerMode) {
+      const interaction = rulerInteractionRef.current;
+      if (!interaction) {
+        updateOverlayCursor(event.currentTarget, point);
+        return;
+      }
+      if (interaction.mode === "move") {
+        setRuler(moveRuler(
+          interaction.startRuler,
+          point.x - interaction.startPoint.x,
+          point.y - interaction.startPoint.y,
+          { width: FRAME_WIDTH, height: FRAME_HEIGHT },
+        ));
+      } else {
+        setRuler(resizeRulerEndpoint(
+          interaction.startRuler,
+          interaction.handle,
+          {
+            x: clamp(point.x, 0, FRAME_WIDTH),
+            y: clamp(point.y, 0, FRAME_HEIGHT),
+          },
+          event.shiftKey ? 45 : undefined,
+        ));
+      }
+      setRulerFitConfidence(null);
+      return;
+    }
     const interaction = roiInteractionRef.current;
     if (!interaction) {
       updateOverlayCursor(event.currentTarget, point);
@@ -1065,6 +1225,7 @@ export default function FringeLab() {
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     roiInteractionRef.current = null;
+    rulerInteractionRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -1073,7 +1234,68 @@ export default function FringeLab() {
 
   const handlePointerCancel = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     roiInteractionRef.current = null;
-    event.currentTarget.style.cursor = calibrationMode ? "crosshair" : "default";
+    rulerInteractionRef.current = null;
+    event.currentTarget.style.cursor = calibrationMode ? "crosshair" : rulerMode ? "default" : "crosshair";
+  };
+
+  const toggleRulerFit = () => {
+    if (sourceMode === "simulator") {
+      setToast("标尺套合仅用于摄像头或实验图片");
+      return;
+    }
+    if (rulerMode) {
+      setRulerMode(false);
+      rulerInteractionRef.current = null;
+      setToast("已取消标尺套合，空间比例未改变");
+      return;
+    }
+    setCalibrationMode(false);
+    setCalibrationPoints([]);
+    setRulerFitConfidence(null);
+    setRulerMode(true);
+    if (sourceMode === "camera" && !isFrozen) freezeCurrentFrame();
+    setToast("拖动标尺主体平移，拖动两端调整长度与角度");
+  };
+
+  const smartSnapRuler = () => {
+    const canvas = frameCanvasRef.current;
+    const context = canvas?.getContext("2d", { willReadFrequently: true });
+    if (!canvas || !context || !rulerMode) return;
+    const suggestion = suggestRulerAlignment(
+      context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT),
+      ruler,
+    );
+    if (!suggestion) {
+      setRulerFitConfidence(null);
+      setToast("未可靠识别刻度尺边缘，请继续手动套合");
+      return;
+    }
+    setRuler(suggestion.ruler);
+    setRulerFitConfidence(suggestion.confidence);
+    setToast(`已给出吸附建议，置信度 ${(suggestion.confidence * 100).toFixed(0)}%，请人工确认`);
+  };
+
+  const applyRulerCalibration = () => {
+    const pixelLength = rulerLengthPx(ruler);
+    const scale = rulerMmPerPixel(ruler);
+    if (scale == null || !Number.isFinite(pixelLength) || pixelLength < MIN_RULER_LENGTH_PX) {
+      setToast(`标尺至少需要 ${MIN_RULER_LENGTH_PX} px，请拉开两个端点`);
+      return;
+    }
+    const uncertainty = rulerUncertaintyPct(ruler);
+    setMmPerPixel(scale);
+    if (uncertainty != null) setCalibrationUncertaintyPct(uncertainty);
+    setCalibrationSource("ruler-fit");
+    setCalibrationStale(false);
+    setCalibrationPoints([]);
+    setRulerMode(false);
+    setToast(`标尺标定已应用：${scale.toFixed(5)} mm/px`);
+  };
+
+  const setManualScale = (value: number) => {
+    setMmPerPixel(value);
+    setCalibrationSource("manual");
+    setCalibrationStale(false);
   };
 
   const exportCsv = () => {
@@ -1108,6 +1330,12 @@ export default function FringeLab() {
             orientation,
             roi,
             mmPerPixel,
+            spatialCalibration: {
+              source: calibrationSource,
+              stale: calibrationStale,
+              ruler,
+              fitConfidence: rulerFitConfidence,
+            },
             screenDistanceM,
             slitWidthMm,
             slitSeparationMm,
@@ -1137,6 +1365,10 @@ export default function FringeLab() {
       orientation,
       roi,
       mmPerPixel,
+      calibrationSource,
+      calibrationStale,
+      ruler,
+      rulerFitConfidence,
       screenDistanceM,
       slitWidthMm,
       slitSeparationMm,
@@ -1169,6 +1401,26 @@ export default function FringeLab() {
       if (typeof value.calibrationUncertaintyPct === "number") setCalibrationUncertaintyPct(value.calibrationUncertaintyPct);
       if (typeof value.smoothingSigma === "number") setSmoothingSigma(value.smoothingSigma);
       if (typeof value.showModelFit === "boolean") setShowModelFit(value.showModelFit);
+      const restoredCalibrationSource = value.calibrationSource === "manual" || value.calibrationSource === "two-point" || value.calibrationSource === "ruler-fit"
+        ? value.calibrationSource
+        : "manual";
+      setCalibrationSource(restoredCalibrationSource);
+      setCalibrationStale(
+        (typeof value.calibrationStale === "boolean" && value.calibrationStale) ||
+        (restoredCalibrationSource === "ruler-fit" && sourceMode === "simulator"),
+      );
+      if (typeof value.rulerFitConfidence === "number") setRulerFitConfidence(value.rulerFitConfidence);
+      if (value.ruler && typeof value.ruler === "object") {
+        const candidate = value.ruler as Partial<RulerCalibration>;
+        if (
+          candidate.start && candidate.end &&
+          Number.isFinite(candidate.start.x) && Number.isFinite(candidate.start.y) &&
+          Number.isFinite(candidate.end.x) && Number.isFinite(candidate.end.y) &&
+          Number.isFinite(candidate.knownLengthMm) && Number(candidate.knownLengthMm) > 0
+        ) {
+          setRuler(candidate as RulerCalibration);
+        }
+      }
       if (value.roi && typeof value.roi === "object") setRoi(value.roi as Roi);
       if (["auto", "r", "g", "b", "luminance"].includes(String(value.channel))) {
         setChannel(value.channel as RequestedProfileChannel);
@@ -1192,6 +1444,11 @@ export default function FringeLab() {
     setReferenceWavelengthNm(wavelengthNm);
     setChannel("auto");
     setMmPerPixel(0.02);
+    setCalibrationSource("manual");
+    setCalibrationStale(false);
+    setRulerMode(false);
+    setRuler(DEFAULT_RULER);
+    setRulerFitConfidence(null);
     setScreenDistanceM(1.5);
     setSlitWidthMm(mode === "double" ? 0.04 : 0.12);
     setSlitSeparationMm(0.25);
@@ -1214,6 +1471,13 @@ export default function FringeLab() {
     ? `${cameraSnapshot.settings.width ?? "?"}×${cameraSnapshot.settings.height ?? "?"}`
     : sourceMode === "simulator" ? "960×540" : "未连接";
   const hasManualExposure = Boolean(cameraSnapshot?.capabilities.exposureMode?.includes("manual"));
+  const calibrationSourceLabel = calibrationStale
+    ? "STALE"
+    : calibrationSource === "ruler-fit" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
+  const currentRulerLengthPx = rulerLengthPx(ruler);
+  const currentRulerScale = rulerMmPerPixel(ruler);
+  const rulerCanApply = Number.isFinite(currentRulerLengthPx) &&
+    currentRulerLengthPx >= MIN_RULER_LENGTH_PX && currentRulerScale != null;
 
   return (
     <main className="lab-app">
@@ -1256,16 +1520,23 @@ export default function FringeLab() {
               <div className="source-tabs" aria-label="输入源">
                 <button className={`source-tab ${sourceMode === "simulator" ? "active" : ""}`} type="button" onClick={stopCamera}>仿真</button>
                 <button className={`source-tab ${sourceMode === "camera" ? "active" : ""}`} type="button" onClick={startCamera}>摄像头</button>
-                <label
+                <button
                   className={`source-tab upload-button ${sourceMode === "image" ? "active" : ""}`}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") event.currentTarget.click();
-                  }}
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-controls="image-file-input"
                 >
-                  图片<input type="file" accept="image/png,image/jpeg,image/webp" onChange={handleImageUpload} />
-                </label>
+                  图片
+                </button>
+                <input
+                  ref={fileInputRef}
+                  id="image-file-input"
+                  className="source-file-input"
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  onChange={handleImageUpload}
+                  tabIndex={-1}
+                />
               </div>
             </div>
             <div className="stage-body">
@@ -1298,7 +1569,7 @@ export default function FringeLab() {
                 </div>
                 <div className="micro-card">
                   <div className="micro-card-label">SPATIAL SCALE</div>
-                  <div className="micro-card-value"><span>{formatNumber(mmPerPixel, 5)} mm/px</span><span>{calibrationPoints.length === 2 ? "2-POINT" : "MANUAL"}</span></div>
+                  <div className="micro-card-value"><span>{formatNumber(mmPerPixel, 5)} mm/px</span><span>{calibrationSourceLabel}</span></div>
                 </div>
                 <div className="micro-card">
                   <div className="micro-card-label">SIGNAL RANGE</div>
@@ -1368,7 +1639,7 @@ export default function FringeLab() {
                   <QualityItem label="饱和像素" value={`${formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%`} level={saturationLevel} />
                   <QualityItem label="条纹采样" value={`${formatNumber(samplingPixels, 1)} px`} level={samplingLevel} />
                   <QualityItem label="Fraunhofer 数" value={formatNumber(analysis?.fresnelNumber ?? null, 4)} level={fresnelLevel} />
-                  <QualityItem label="空间标定" value={`${formatNumber(mmPerPixel, 5)} mm/px`} level={mmPerPixel > 0 ? "good" : "danger"} />
+                  <QualityItem label="空间标定" value={calibrationStale ? "需重新标定" : `${formatNumber(mmPerPixel, 5)} mm/px`} level={calibrationStale ? "warn" : mmPerPixel > 0 ? "good" : "danger"} />
                   <QualityItem label="曝光锁定" value={sourceMode === "camera" ? cameraLocked ? "LOCKED" : hasManualExposure ? "AVAILABLE" : "UNAVAILABLE" : "N/A"} level={sourceMode !== "camera" || cameraLocked ? "good" : "warn"} />
                   <QualityItem label="小角差异" value={`${formatNumber(analysis?.smallAngleDifferencePct ?? null, 3)}%`} level={(analysis?.smallAngleDifferencePct ?? 0) < 0.5 ? "good" : "warn"} />
                 </div>
@@ -1454,21 +1725,61 @@ export default function FringeLab() {
                   <option value="luminance">亮度 Y</option>
                 </select>
               </div>
-              <FieldNumber label="空间比例" value={mmPerPixel} unit="mm/px" min={0.00001} step={0.00001} onChange={setMmPerPixel} />
-              <FieldNumber label="标定长度" value={calibrationLengthMm} unit="mm" min={0.001} step={0.1} onChange={setCalibrationLengthMm} />
+              <FieldNumber label="空间比例" value={mmPerPixel} unit="mm/px" min={0.00001} step={0.00001} onChange={setManualScale} />
+              <FieldNumber
+                label="标尺实际区间"
+                value={ruler.knownLengthMm}
+                unit="mm"
+                min={0.001}
+                step={0.1}
+                onChange={(value) => setRuler((current) => ({ ...current, knownLengthMm: value }))}
+              />
               <FieldNumber label="标定相对不确定度" value={calibrationUncertaintyPct} unit="%" min={0} step={0.1} onChange={setCalibrationUncertaintyPct} />
               <FieldNumber label="高斯平滑 σ" value={smoothingSigma} unit="px" min={0} max={10} step={0.1} onChange={setSmoothingSigma} />
             </div>
             <div className="button-row space-top-md">
-              <button type="button" className={`button ${calibrationMode ? "warn" : "primary"}`} onClick={() => { setCalibrationMode((value) => !value); setCalibrationPoints([]); }}>
+              <button type="button" className={`button ${calibrationMode ? "warn" : ""}`} onClick={() => { setRulerMode(false); setCalibrationMode((value) => !value); setCalibrationPoints([]); }}>
                 {calibrationMode ? "取消标定" : "两点标定"}
+              </button>
+              <button
+                type="button"
+                className={`button ${rulerMode ? "warn" : "primary"}`}
+                disabled={sourceMode === "simulator"}
+                title={sourceMode === "simulator" ? "标尺套合用于摄像头或实验图片" : "将虚拟毫米尺套合到画面中的真实刻度尺"}
+                onClick={toggleRulerFit}
+              >
+                {rulerMode ? "取消套合" : "标尺套合"}
               </button>
               <button type="button" className="button" onClick={() => setRoi(DEFAULT_ROI)}>重置 ROI</button>
               <button type="button" className="button" onClick={freezeCurrentFrame}>冻结当前帧</button>
             </div>
-            <div className={`notice space-top-sm ${calibrationMode ? "warn" : ""}`}>
-              {calibrationMode ? `请在画面标尺上依次点击两端，实际距离设为 ${calibrationLengthMm} mm。` : "拖动 ROI 内部改变位置；拖动四角方块调整长宽；调整角度使采样轴垂直于条纹。"}
+            {rulerMode ? (
+              <div className="ruler-console space-top-sm" aria-label="毫米标尺套合控制">
+                <div className="ruler-readout">
+                  <span><small>实际区间</small>{ruler.knownLengthMm.toFixed(1)} mm</span>
+                  <span><small>像素长度</small>{currentRulerLengthPx.toFixed(1)} px</span>
+                  <span><small>比例</small>{currentRulerScale?.toFixed(5) ?? "—"} mm/px</span>
+                  <span><small>角度</small>{rulerAngleDeg(ruler).toFixed(1)}°</span>
+                </div>
+                <div className="button-row">
+                  <button type="button" className="button" onClick={smartSnapRuler}>智能吸附</button>
+                  <button type="button" className="button primary" disabled={!rulerCanApply} onClick={applyRulerCalibration}>应用标定</button>
+                </div>
+                {rulerFitConfidence != null ? <div className="ruler-confidence">吸附建议置信度 {(rulerFitConfidence * 100).toFixed(0)}% · 请人工确认刻度重合</div> : null}
+              </div>
+            ) : null}
+            <div className={`notice space-top-sm ${calibrationMode || rulerMode || calibrationStale ? "warn" : ""}`}>
+              {rulerMode
+                ? "拖动标尺主体平移，拖动两端控制点改变长度与角度；按住 Shift 可吸附到 0°/45°/90°。"
+                : calibrationMode
+                  ? `请在画面标尺上依次点击两端，实际距离设为 ${ruler.knownLengthMm} mm。`
+                  : calibrationStale
+                    ? "输入源已经变化，原标尺比例可能失效，请重新执行标尺套合或手动标定。"
+                    : sourceMode === "simulator"
+                      ? "拖动 ROI 内部改变位置；拖动四角方块调整长宽。标尺套合用于摄像头或实验图片。"
+                      : "拖动 ROI 内部改变位置；拖动四角调整长宽；需要真实尺寸时可使用标尺套合。"}
             </div>
+            {rulerMode ? <div className="notice space-top-xs">刻度尺必须与光斑处于同一光屏平面并尽量靠近 ROI。明显透视或不同深度会使全局 mm/px 失效。</div> : null}
             <div className="button-row space-top-sm">
               <button type="button" className="button" disabled={!analysis} onClick={() => { setBackground(analysis?.raw ?? null); setToast("已采集当前 ROI 为背景"); }}>采集背景</button>
               <button type="button" className="button" disabled={!background} onClick={() => setBackground(null)}>清除背景</button>
