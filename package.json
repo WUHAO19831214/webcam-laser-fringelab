@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "build:netlify": "next build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test:unit": "node --experimental-strip-types --test tests/physics.test.ts tests/signal.test.ts tests/integration.test.ts tests/ui-interactions.test.ts tests/ruler.test.ts tests/ruler-detection.test.ts",
     "test:ssr": "node --test tests/rendered-html.test.mjs",
