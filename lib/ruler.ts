@@ -5,6 +5,10 @@ export type RulerCalibration = {
   start: Point;
   end: Point;
   knownLengthMm: number;
+  /** Tick direction in ruler-local coordinates. -1 draws above the baseline. */
+  tickSide?: 1 | -1;
+  /** Optional absolute value at the first virtual tick; scale does not depend on it. */
+  originMm?: number;
 };
 
 export type RulerHandle = "start" | "end" | "body";

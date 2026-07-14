@@ -66,11 +66,36 @@ import {
   suggestRulerAlignment,
   type RulerCalibration,
 } from "@/lib/ruler";
+import {
+  clientPointToImagePoint,
+  detectPhysicalRuler,
+  resolveRulerTheme,
+  resolveRulerThemeFromSamples,
+  rulerFromDetection,
+  snapRulerToDetection,
+  type RulerContrastMode,
+  type RulerDetectionResult,
+  type RulerRegion,
+  type RulerTheme,
+} from "@/lib/ruler-detection";
 
 type SourceMode = "simulator" | "camera" | "image";
 type ExperimentMode = "double" | "single";
 type Level = "good" | "warn" | "danger";
-type SpatialCalibrationSource = "manual" | "two-point" | "ruler-fit";
+type SpatialCalibrationSource =
+  | "manual-scale"
+  | "two-point"
+  | "physical-ruler-overlay"
+  | "physical-ruler-perspective";
+
+type CanvasInteractionMode =
+  | "roi"
+  | "two-point-calibration"
+  | "ruler-region-selection"
+  | "ruler-auto-detection"
+  | "ruler-overlay-adjustment"
+  | "ruler-perspective-adjustment"
+  | "none";
 
 type Roi = RoiGeometry;
 
@@ -151,7 +176,9 @@ const DEFAULT_RULER: RulerCalibration = {
   start: { x: 180, y: 430 },
   end: { x: 780, y: 430 },
   knownLengthMm: 50,
+  tickSide: -1,
 };
+const DEFAULT_RULER_THEME = resolveRulerThemeFromSamples([20, 24, 28, 32], "auto");
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
@@ -582,6 +609,9 @@ export default function FringeLab() {
   const lastFrameRef = useRef(0);
   const roiInteractionRef = useRef<RoiInteraction | null>(null);
   const rulerInteractionRef = useRef<RulerInteraction | null>(null);
+  const rulerRegionStartRef = useRef<Point | null>(null);
+  const rulerWorkerRef = useRef<Worker | null>(null);
+  const rulerDetectionRequestRef = useRef(0);
 
   const [sourceMode, setSourceMode] = useState<SourceMode>("simulator");
   const [experiment, setExperiment] = useState<ExperimentMode>("double");
@@ -610,13 +640,28 @@ export default function FringeLab() {
   const [cameraLocked, setCameraLocked] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isFrozen, setIsFrozen] = useState(false);
+  const [imageLoaded, setImageLoaded] = useState(false);
   const [calibrationMode, setCalibrationMode] = useState(false);
   const [calibrationPoints, setCalibrationPoints] = useState<Array<{ x: number; y: number }>>([]);
+  const [twoPointDistanceMm, setTwoPointDistanceMm] = useState(50);
   const [ruler, setRuler] = useState<RulerCalibration>(DEFAULT_RULER);
   const [rulerMode, setRulerMode] = useState(false);
-  const [calibrationSource, setCalibrationSource] = useState<SpatialCalibrationSource>("manual");
+  const [canvasInteractionMode, setCanvasInteractionMode] = useState<CanvasInteractionMode>("roi");
+  const [calibrationSource, setCalibrationSource] = useState<SpatialCalibrationSource>("manual-scale");
   const [calibrationStale, setCalibrationStale] = useState(false);
   const [rulerFitConfidence, setRulerFitConfidence] = useState<number | null>(null);
+  const [rulerPanelOpen, setRulerPanelOpen] = useState(false);
+  const [rulerContrastMode, setRulerContrastMode] = useState<RulerContrastMode>("auto");
+  const [rulerTheme, setRulerTheme] = useState<RulerTheme>(DEFAULT_RULER_THEME);
+  const [rulerDetection, setRulerDetection] = useState<RulerDetectionResult | null>(null);
+  const [rulerDetectionState, setRulerDetectionState] = useState<"idle" | "detecting" | "candidate" | "applied" | "failed" | "stale">("idle");
+  const [rulerDetectionProgress, setRulerDetectionProgress] = useState(0);
+  const [rulerRegion, setRulerRegion] = useState<RulerRegion | null>(null);
+  const [tickSnapEnabled, setTickSnapEnabled] = useState(true);
+  const [numberSnapEnabled, setNumberSnapEnabled] = useState(true);
+  const [manualOriginMm, setManualOriginMm] = useState(0);
+  const [lowConfidenceConfirmed, setLowConfidenceConfirmed] = useState(false);
+  const [snapHighlight, setSnapHighlight] = useState<string | null>(null);
   const [showModelFit, setShowModelFit] = useState(true);
   const [toast, setToast] = useState("");
 
@@ -721,6 +766,7 @@ export default function FringeLab() {
     return () => {
       closeCamera(streamRef.current);
       if (animationRef.current != null) cancelAnimationFrame(animationRef.current);
+      rulerWorkerRef.current?.terminate();
     };
   }, []);
 
@@ -763,6 +809,22 @@ export default function FringeLab() {
     );
     processCurrentCanvas();
   }, [sourceMode, processCurrentCanvas]);
+
+  useEffect(() => {
+    if (!rulerMode) return;
+    const canvas = frameCanvasRef.current;
+    const context = canvas?.getContext("2d", { willReadFrequently: true });
+    if (!canvas || !context) return;
+    try {
+      setRulerTheme(resolveRulerTheme(
+        context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT),
+        ruler,
+        rulerContrastMode,
+      ));
+    } catch {
+      setRulerTheme(resolveRulerThemeFromSamples([24, 30, 36], rulerContrastMode));
+    }
+  }, [ruler, rulerMode, rulerContrastMode, sourceMode]);
 
   useEffect(() => {
     const overlay = overlayCanvasRef.current;
@@ -820,48 +882,111 @@ export default function FringeLab() {
       context.restore();
     }
 
+    if (rulerRegion) {
+      context.save();
+      context.strokeStyle = "#ff5bd7";
+      context.fillStyle = "rgba(255,91,215,.07)";
+      context.lineWidth = 2;
+      context.setLineDash([7, 5]);
+      context.fillRect(rulerRegion.x, rulerRegion.y, rulerRegion.width, rulerRegion.height);
+      context.strokeRect(rulerRegion.x, rulerRegion.y, rulerRegion.width, rulerRegion.height);
+      context.restore();
+    }
+
+    if (rulerDetection && (rulerMode || rulerDetectionState === "candidate")) {
+      context.save();
+      context.strokeStyle = "rgba(89,244,224,.7)";
+      context.lineWidth = 1.25;
+      context.setLineDash([5, 4]);
+      context.beginPath();
+      rulerDetection.rulerBodyCorners.forEach((point, index) => {
+        if (index === 0) context.moveTo(point.x, point.y);
+        else context.lineTo(point.x, point.y);
+      });
+      context.closePath();
+      context.stroke();
+      context.setLineDash([]);
+      for (const tick of rulerDetection.ticks.filter((item) => item.inlier && item.kind !== "minor")) {
+        context.beginPath();
+        context.arc(tick.point.x, tick.point.y, tick.kind === "major" ? 4 : 2.5, 0, Math.PI * 2);
+        context.fillStyle = tick.kind === "major" ? "#59f4e0" : "rgba(89,244,224,.7)";
+        context.fill();
+      }
+      context.restore();
+    }
+
     if (rulerMode) {
       const length = rulerLengthPx(ruler);
       const angleRadians = rulerAngleDeg(ruler) * Math.PI / 180;
       const ticks = generateRulerTicks(ruler);
       const scale = rulerMmPerPixel(ruler);
+      const tickSide = ruler.tickSide ?? -1;
+      const bodyTop = tickSide === 1 ? -2 : -40;
+      const drawOutlinedStroke = (drawPath: () => void, width = 1.6) => {
+        context.beginPath();
+        drawPath();
+        context.strokeStyle = rulerTheme.outline;
+        context.lineWidth = rulerTheme.complexBackground ? width + 4.2 : width + 3;
+        context.stroke();
+        context.beginPath();
+        drawPath();
+        context.strokeStyle = rulerTheme.stroke;
+        context.lineWidth = width;
+        context.stroke();
+      };
+      const drawOutlinedText = (text: string, x: number, y: number) => {
+        context.lineJoin = "round";
+        context.strokeStyle = rulerTheme.outline;
+        context.lineWidth = rulerTheme.complexBackground ? 4 : 3;
+        context.strokeText(text, x, y);
+        context.fillStyle = rulerTheme.stroke;
+        context.fillText(text, x, y);
+      };
       context.save();
       context.translate(ruler.start.x, ruler.start.y);
       context.rotate(angleRadians);
-      context.fillStyle = "rgba(255, 199, 102, .13)";
-      context.strokeStyle = "rgba(255, 199, 102, .95)";
-      context.lineWidth = 1.5;
-      context.fillRect(0, -38, length, 40);
-      context.strokeRect(0, -38, length, 40);
-      context.beginPath();
-      context.moveTo(0, 0);
-      context.lineTo(length, 0);
-      context.stroke();
+      context.fillStyle = rulerTheme.fill;
+      context.fillRect(0, bodyTop, length, 42);
+      drawOutlinedStroke(() => context.rect(0, bodyTop, length, 42));
+      drawOutlinedStroke(() => { context.moveTo(0, 0); context.lineTo(length, 0); }, 2);
       context.font = "bold 9px monospace";
       context.textAlign = "center";
-      context.fillStyle = "#ffd27d";
       for (const tick of ticks) {
         const x = Math.hypot(tick.point.x - ruler.start.x, tick.point.y - ruler.start.y);
         const height = tick.kind === "major" ? 24 : tick.kind === "medium" ? 16 : 9;
-        context.beginPath();
-        context.moveTo(x, 0);
-        context.lineTo(x, -height);
-        context.stroke();
-        if (tick.kind === "major") context.fillText(String(tick.millimetre), x, -27);
+        drawOutlinedStroke(() => {
+          context.moveTo(x, 0);
+          context.lineTo(x, height * tickSide);
+        }, tick.kind === "major" ? 1.9 : 1.35);
+        if (tick.kind === "major") {
+          const label = (tick.millimetre + (ruler.originMm ?? 0)).toFixed(0);
+          drawOutlinedText(label, x, (height + 5) * tickSide + (tickSide === 1 ? 8 : 0));
+        }
       }
+      // Rotation cue: a compact arc and direction ray share the same contrast treatment.
+      drawOutlinedStroke(() => {
+        context.arc(0, 0, 17, tickSide === 1 ? -0.55 : 0.55, 0, tickSide === -1);
+        context.moveTo(0, 0);
+        context.lineTo(17, 0);
+      }, 1.2);
       context.restore();
 
       for (const point of [ruler.start, ruler.end]) {
         context.beginPath();
         context.arc(point.x, point.y, 9, 0, Math.PI * 2);
-        context.fillStyle = "rgba(5, 13, 20, .95)";
+        context.fillStyle = rulerTheme.handleFill;
         context.fill();
-        context.lineWidth = 3;
-        context.strokeStyle = "#ffc766";
+        context.lineWidth = 5;
+        context.strokeStyle = rulerTheme.outline;
+        context.stroke();
+        context.beginPath();
+        context.arc(point.x, point.y, 9, 0, Math.PI * 2);
+        context.lineWidth = 2.5;
+        context.strokeStyle = rulerTheme.stroke;
         context.stroke();
         context.beginPath();
         context.arc(point.x, point.y, 3, 0, Math.PI * 2);
-        context.fillStyle = "#ffc766";
+        context.fillStyle = rulerTheme.stroke;
         context.fill();
       }
 
@@ -869,22 +994,42 @@ export default function FringeLab() {
         x: (ruler.start.x + ruler.end.x) / 2,
         y: (ruler.start.y + ruler.end.y) / 2,
       };
-      const summary = `${ruler.knownLengthMm.toFixed(1)} mm · ${length.toFixed(1)} px · ${scale?.toFixed(5) ?? "—"} mm/px`;
+      const summary = `${ruler.knownLengthMm.toFixed(1)} mm · ${length.toFixed(1)} px · ${scale?.toFixed(5) ?? "—"} mm/px · ${rulerAngleDeg(ruler).toFixed(1)}°`;
       context.font = "bold 11px monospace";
       context.textAlign = "center";
       const summaryWidth = context.measureText(summary).width + 18;
       const labelY = clamp(midpoint.y + 34, 22, FRAME_HEIGHT - 8);
-      context.fillStyle = "rgba(5, 13, 20, .9)";
+      context.fillStyle = rulerTheme.labelFill;
       context.fillRect(
         clamp(midpoint.x - summaryWidth / 2, 4, FRAME_WIDTH - summaryWidth - 4),
         labelY - 16,
         summaryWidth,
         22,
       );
-      context.fillStyle = "#ffd27d";
-      context.fillText(summary, clamp(midpoint.x, summaryWidth / 2 + 4, FRAME_WIDTH - summaryWidth / 2 - 4), labelY);
+      context.strokeStyle = rulerTheme.outline;
+      context.lineWidth = rulerTheme.complexBackground ? 4 : 3;
+      const labelX = clamp(midpoint.x, summaryWidth / 2 + 4, FRAME_WIDTH - summaryWidth / 2 - 4);
+      context.strokeText(summary, labelX, labelY);
+      context.fillStyle = rulerTheme.labelText;
+      context.fillText(summary, labelX, labelY);
+
+      if (snapHighlight) {
+        context.font = "bold 10px monospace";
+        context.fillStyle = "#59f4e0";
+        context.fillText(`MAGNET · ${snapHighlight}`, midpoint.x, clamp(midpoint.y - 50, 16, FRAME_HEIGHT - 16));
+      }
     }
-  }, [roi, calibrationPoints, ruler, rulerMode]);
+  }, [
+    roi,
+    calibrationPoints,
+    ruler,
+    rulerMode,
+    rulerTheme,
+    rulerRegion,
+    rulerDetection,
+    rulerDetectionState,
+    snapHighlight,
+  ]);
 
   useEffect(() => {
     const canvas = chartCanvasRef.current;
@@ -971,11 +1116,20 @@ export default function FringeLab() {
   }, [toast]);
 
   const invalidateRulerCalibrationForNewSource = () => {
-    if (calibrationSource === "ruler-fit") setCalibrationStale(true);
+    if (calibrationSource === "physical-ruler-overlay" || calibrationSource === "physical-ruler-perspective") {
+      setCalibrationStale(true);
+      setRulerDetectionState("stale");
+    }
+    rulerDetectionRequestRef.current += 1;
+    rulerWorkerRef.current?.terminate();
+    rulerWorkerRef.current = null;
     setRulerMode(false);
+    setCanvasInteractionMode("roi");
     setCalibrationMode(false);
     setCalibrationPoints([]);
     setRulerFitConfidence(null);
+    setRulerRegion(null);
+    setSnapHighlight(null);
   };
 
   const startCamera = async () => {
@@ -1039,6 +1193,7 @@ export default function FringeLab() {
       setCameraSnapshot(null);
       setCameraLocked(false);
       imageRef.current = image;
+      setImageLoaded(true);
       setSourceMode("image");
       setIsFrozen(true);
       setToast(`已载入 ${file.name}`);
@@ -1061,6 +1216,7 @@ export default function FringeLab() {
       setCameraSnapshot(null);
       setCameraLocked(false);
       imageRef.current = image;
+      setImageLoaded(true);
       setSourceMode("image");
       setIsFrozen(true);
       setToast("已冻结当前帧");
@@ -1070,13 +1226,140 @@ export default function FringeLab() {
 
   const pointerPosition = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rectangle = event.currentTarget.getBoundingClientRect();
-    return {
-      x: (event.clientX - rectangle.left) / rectangle.width * FRAME_WIDTH,
-      y: (event.clientY - rectangle.top) / rectangle.height * FRAME_HEIGHT,
+    return clientPointToImagePoint(
+      { x: event.clientX, y: event.clientY },
+      rectangle,
+      { width: FRAME_WIDTH, height: FRAME_HEIGHT },
+    );
+  };
+
+  const finishRulerDetection = (result: RulerDetectionResult | null, requestId: number) => {
+    if (requestId !== rulerDetectionRequestRef.current) return;
+    rulerWorkerRef.current?.terminate();
+    rulerWorkerRef.current = null;
+    setRulerDetectionProgress(100);
+    if (!result) {
+      setRulerDetectionState("failed");
+      setCanvasInteractionMode("none");
+      setToast("未可靠识别实物刻度尺，请框选尺子区域后重试");
+      return;
+    }
+    const nextRuler = rulerFromDetection(result);
+    setRulerDetection(result);
+    setRuler(nextRuler);
+    setRulerTheme(result.theme);
+    setRulerFitConfidence(result.fit.confidence);
+    setRulerRegion(result.selectedRegion);
+    setRulerMode(true);
+    setCalibrationMode(false);
+    setCanvasInteractionMode("ruler-overlay-adjustment");
+    setRulerDetectionState("candidate");
+    setLowConfidenceConfirmed(false);
+    setRulerPanelOpen(true);
+    setToast(
+      `已拟合 ${result.fit.inlierCount}/${result.fit.totalCount} 条刻线，${result.fit.mmPerPixel.toFixed(5)} mm/px；请人工确认`,
+    );
+  };
+
+  const runPhysicalRulerDetection = (selectedRegion?: RulerRegion) => {
+    if (sourceMode === "simulator") {
+      setToast("仿真图样已有已知空间比例，无需实物标尺标定");
+      return;
+    }
+    const canvas = frameCanvasRef.current;
+    const context = canvas?.getContext("2d", { willReadFrequently: true });
+    if (!canvas || !context) {
+      setToast("当前没有可分析的图像帧");
+      return;
+    }
+    if (sourceMode === "camera" && !isFrozen) setIsFrozen(true);
+    rulerDetectionRequestRef.current += 1;
+    const requestId = rulerDetectionRequestRef.current;
+    rulerWorkerRef.current?.terminate();
+    setRulerDetectionState("detecting");
+    setCanvasInteractionMode("ruler-auto-detection");
+    setRulerDetectionProgress(12);
+    setRulerRegion(selectedRegion ?? null);
+    setRulerMode(false);
+    setCalibrationMode(false);
+    const imageData = context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+    const fallbackImageData: ImageDataLike = {
+      width: imageData.width,
+      height: imageData.height,
+      data: new Uint8ClampedArray(imageData.data),
     };
+    const sourceType = sourceMode === "camera" ? "camera" : "image";
+    const options = {
+      sourceType,
+      region: selectedRegion,
+      contrastMode: rulerContrastMode,
+      tickSnapEnabled,
+      numberSnapEnabled,
+      manualOriginMm,
+    } as const;
+
+    const progressTimer = window.setTimeout(() => {
+      if (requestId === rulerDetectionRequestRef.current) setRulerDetectionProgress(58);
+    }, 120);
+    try {
+      const worker = new Worker(new URL("../lib/ruler.worker.ts", import.meta.url), { type: "module" });
+      rulerWorkerRef.current = worker;
+      worker.onmessage = (event: MessageEvent<{ id: number; result?: RulerDetectionResult | null; error?: string }>) => {
+        window.clearTimeout(progressTimer);
+        if (event.data.error) {
+          finishRulerDetection(null, event.data.id);
+          return;
+        }
+        finishRulerDetection(event.data.result ?? null, event.data.id);
+      };
+      worker.onerror = () => {
+        window.clearTimeout(progressTimer);
+        worker.terminate();
+        rulerWorkerRef.current = null;
+        window.setTimeout(() => {
+          finishRulerDetection(detectPhysicalRuler(fallbackImageData, options), requestId);
+        }, 0);
+      };
+      worker.postMessage({
+        id: requestId,
+        width: imageData.width,
+        height: imageData.height,
+        buffer: imageData.data.buffer,
+        ...options,
+      }, [imageData.data.buffer]);
+    } catch {
+      window.clearTimeout(progressTimer);
+      window.setTimeout(() => {
+        finishRulerDetection(detectPhysicalRuler(fallbackImageData, options), requestId);
+      }, 0);
+    }
+  };
+
+  const cancelRulerDetection = () => {
+    rulerDetectionRequestRef.current += 1;
+    rulerWorkerRef.current?.terminate();
+    rulerWorkerRef.current = null;
+    rulerInteractionRef.current = null;
+    rulerRegionStartRef.current = null;
+    setRulerMode(false);
+    setCalibrationMode(false);
+    setCanvasInteractionMode("roi");
+    setRulerDetectionProgress(0);
+    setRulerRegion(null);
+    setSnapHighlight(null);
+    setRulerDetectionState(calibrationStale ? "stale" : "idle");
+    setToast("已取消标尺识别，空间比例未改变");
   };
 
   const updateOverlayCursor = (canvas: HTMLCanvasElement, point: Point) => {
+    if (canvasInteractionMode === "ruler-region-selection" || canvasInteractionMode === "two-point-calibration") {
+      canvas.style.cursor = "crosshair";
+      return;
+    }
+    if (canvasInteractionMode === "ruler-auto-detection") {
+      canvas.style.cursor = "progress";
+      return;
+    }
     if (rulerMode) {
       const handle = hitTestRuler(ruler, point);
       canvas.style.cursor = handle === "body"
@@ -1093,17 +1376,25 @@ export default function FringeLab() {
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointerPosition(event);
+    if (canvasInteractionMode === "ruler-auto-detection") return;
+    if (canvasInteractionMode === "ruler-region-selection") {
+      rulerRegionStartRef.current = point;
+      setRulerRegion({ x: point.x, y: point.y, width: 0, height: 0 });
+      event.currentTarget.style.cursor = "crosshair";
+      return;
+    }
     if (calibrationMode) {
       const next = calibrationPoints.length >= 2 ? [point] : [...calibrationPoints, point];
       setCalibrationPoints(next);
       if (next.length === 2) {
         const pixelDistance = Math.hypot(next[1].x - next[0].x, next[1].y - next[0].y);
         if (pixelDistance > 1) {
-          setMmPerPixel(ruler.knownLengthMm / pixelDistance);
+          setMmPerPixel(twoPointDistanceMm / pixelDistance);
           setCalibrationSource("two-point");
           setCalibrationStale(false);
           setCalibrationMode(false);
-          setToast(`标定完成：${(ruler.knownLengthMm / pixelDistance).toFixed(5)} mm/px`);
+          setCanvasInteractionMode("roi");
+          setToast(`两点标定完成：${(twoPointDistanceMm / pixelDistance).toFixed(5)} mm/px`);
         }
       }
       return;
@@ -1157,23 +1448,35 @@ export default function FringeLab() {
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (calibrationMode) return;
     const point = pointerPosition(event);
+    if (canvasInteractionMode === "ruler-auto-detection" || calibrationMode) return;
+    if (canvasInteractionMode === "ruler-region-selection") {
+      const start = rulerRegionStartRef.current;
+      if (!start) return;
+      setRulerRegion({
+        x: Math.min(start.x, point.x),
+        y: Math.min(start.y, point.y),
+        width: Math.abs(point.x - start.x),
+        height: Math.abs(point.y - start.y),
+      });
+      return;
+    }
     if (rulerMode) {
       const interaction = rulerInteractionRef.current;
       if (!interaction) {
         updateOverlayCursor(event.currentTarget, point);
         return;
       }
+      let nextRuler: RulerCalibration;
       if (interaction.mode === "move") {
-        setRuler(moveRuler(
+        nextRuler = moveRuler(
           interaction.startRuler,
           point.x - interaction.startPoint.x,
           point.y - interaction.startPoint.y,
           { width: FRAME_WIDTH, height: FRAME_HEIGHT },
-        ));
+        );
       } else {
-        setRuler(resizeRulerEndpoint(
+        nextRuler = resizeRulerEndpoint(
           interaction.startRuler,
           interaction.handle,
           {
@@ -1181,8 +1484,21 @@ export default function FringeLab() {
             y: clamp(point.y, 0, FRAME_HEIGHT),
           },
           event.shiftKey ? 45 : undefined,
-        ));
+        );
       }
+      if (rulerDetection && (tickSnapEnabled || numberSnapEnabled) && !event.altKey) {
+        const displayScale = event.currentTarget.getBoundingClientRect().width / FRAME_WIDTH;
+        const snap = snapRulerToDetection(nextRuler, rulerDetection, {
+          tickSnapEnabled,
+          numberSnapEnabled,
+          displayScale,
+        });
+        nextRuler = snap.ruler;
+        setSnapHighlight(snap.snapped ? snap.target === "number" ? "数字锚点" : snap.target === "tick" ? "毫米刻线" : "尺体长边" : null);
+      } else {
+        setSnapHighlight(null);
+      }
+      setRuler(nextRuler);
       setRulerFitConfidence(null);
       return;
     }
@@ -1224,6 +1540,23 @@ export default function FringeLab() {
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (canvasInteractionMode === "ruler-region-selection" && rulerRegionStartRef.current) {
+      const start = rulerRegionStartRef.current;
+      const point = pointerPosition(event);
+      const selectedRegion = {
+        x: Math.min(start.x, point.x),
+        y: Math.min(start.y, point.y),
+        width: Math.abs(point.x - start.x),
+        height: Math.abs(point.y - start.y),
+      };
+      rulerRegionStartRef.current = null;
+      if (selectedRegion.width >= 28 && selectedRegion.height >= 20) {
+        runPhysicalRulerDetection(selectedRegion);
+      } else {
+        setRulerRegion(null);
+        setToast("框选区域太小，请完整框住实物刻度尺");
+      }
+    }
     roiInteractionRef.current = null;
     rulerInteractionRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -1235,7 +1568,8 @@ export default function FringeLab() {
   const handlePointerCancel = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     roiInteractionRef.current = null;
     rulerInteractionRef.current = null;
-    event.currentTarget.style.cursor = calibrationMode ? "crosshair" : rulerMode ? "default" : "crosshair";
+    rulerRegionStartRef.current = null;
+    event.currentTarget.style.cursor = calibrationMode || canvasInteractionMode === "ruler-region-selection" ? "crosshair" : rulerMode ? "default" : "crosshair";
   };
 
   const toggleRulerFit = () => {
@@ -1245,6 +1579,7 @@ export default function FringeLab() {
     }
     if (rulerMode) {
       setRulerMode(false);
+      setCanvasInteractionMode("roi");
       rulerInteractionRef.current = null;
       setToast("已取消标尺套合，空间比例未改变");
       return;
@@ -1253,14 +1588,43 @@ export default function FringeLab() {
     setCalibrationPoints([]);
     setRulerFitConfidence(null);
     setRulerMode(true);
-    if (sourceMode === "camera" && !isFrozen) freezeCurrentFrame();
-    setToast("拖动标尺主体平移，拖动两端调整长度与角度");
+    setCanvasInteractionMode("ruler-overlay-adjustment");
+    setRulerPanelOpen(true);
+    if (sourceMode === "camera" && !isFrozen) setIsFrozen(true);
+    setToast("已进入手动套合：拖动尺体平移，拖动两端调整长度与角度");
+  };
+
+  const startRulerRegionSelection = () => {
+    if (sourceMode === "simulator") return;
+    if (sourceMode === "camera" && !isFrozen) setIsFrozen(true);
+    rulerDetectionRequestRef.current += 1;
+    rulerWorkerRef.current?.terminate();
+    rulerWorkerRef.current = null;
+    setCalibrationMode(false);
+    setRulerMode(false);
+    setRulerRegion(null);
+    setCanvasInteractionMode("ruler-region-selection");
+    setRulerDetectionState("idle");
+    setToast("请拖动矩形，完整框住实物刻度尺");
   };
 
   const smartSnapRuler = () => {
     const canvas = frameCanvasRef.current;
     const context = canvas?.getContext("2d", { willReadFrequently: true });
     if (!canvas || !context || !rulerMode) return;
+    if (rulerDetection) {
+      const detectedRuler = rulerFromDetection({
+        ...rulerDetection,
+        manualOriginMm,
+        tickSnapEnabled,
+        numberSnapEnabled,
+      });
+      setRuler(detectedRuler);
+      setRulerFitConfidence(rulerDetection.fit.confidence);
+      setSnapHighlight(rulerDetection.numbers.length > 0 ? "数字锚点" : "毫米刻线");
+      setToast("虚拟尺已重新吸附到稳健刻线拟合结果，请核对重合情况");
+      return;
+    }
     const suggestion = suggestRulerAlignment(
       context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT),
       ruler,
@@ -1282,19 +1646,33 @@ export default function FringeLab() {
       setToast(`标尺至少需要 ${MIN_RULER_LENGTH_PX} px，请拉开两个端点`);
       return;
     }
+    if ((rulerDetection?.fit.confidence ?? 1) < 0.55 && !lowConfidenceConfirmed) {
+      setToast("当前识别置信度较低，请勾选人工核对后再应用");
+      return;
+    }
     const uncertainty = rulerUncertaintyPct(ruler);
     setMmPerPixel(scale);
     if (uncertainty != null) setCalibrationUncertaintyPct(uncertainty);
-    setCalibrationSource("ruler-fit");
+    setCalibrationSource("physical-ruler-overlay");
     setCalibrationStale(false);
     setCalibrationPoints([]);
     setRulerMode(false);
+    setCanvasInteractionMode("roi");
+    setRulerDetectionState("applied");
+    setRulerDetection((current) => current ? {
+      ...current,
+      manualOriginMm,
+      contrastMode: rulerContrastMode,
+      theme: rulerTheme,
+      tickSnapEnabled,
+      numberSnapEnabled,
+    } : current);
     setToast(`标尺标定已应用：${scale.toFixed(5)} mm/px`);
   };
 
   const setManualScale = (value: number) => {
     setMmPerPixel(value);
-    setCalibrationSource("manual");
+    setCalibrationSource("manual-scale");
     setCalibrationStale(false);
   };
 
@@ -1320,7 +1698,7 @@ export default function FringeLab() {
     downloadText(
       JSON.stringify(
         {
-          schema: "fringelab.measurement.v1",
+          schema: "fringelab.measurement.v2",
           createdAt: new Date().toISOString(),
           terminology: "Relative intensity (camera response, arbitrary units); not lux.",
           configuration: {
@@ -1331,10 +1709,18 @@ export default function FringeLab() {
             roi,
             mmPerPixel,
             spatialCalibration: {
-              source: calibrationSource,
+              calibrationMethod: calibrationSource,
               stale: calibrationStale,
               ruler,
               fitConfidence: rulerFitConfidence,
+              interactionMode: canvasInteractionMode,
+              rulerDetection,
+              manualAdjustments: {
+                contrastMode: rulerContrastMode,
+                manualOriginMm,
+                tickSnapEnabled,
+                numberSnapEnabled,
+              },
             },
             screenDistanceM,
             slitWidthMm,
@@ -1369,6 +1755,13 @@ export default function FringeLab() {
       calibrationStale,
       ruler,
       rulerFitConfidence,
+      rulerDetection,
+      rulerDetectionState,
+      rulerContrastMode,
+      tickSnapEnabled,
+      numberSnapEnabled,
+      manualOriginMm,
+      twoPointDistanceMm,
       screenDistanceM,
       slitWidthMm,
       slitSeparationMm,
@@ -1401,15 +1794,35 @@ export default function FringeLab() {
       if (typeof value.calibrationUncertaintyPct === "number") setCalibrationUncertaintyPct(value.calibrationUncertaintyPct);
       if (typeof value.smoothingSigma === "number") setSmoothingSigma(value.smoothingSigma);
       if (typeof value.showModelFit === "boolean") setShowModelFit(value.showModelFit);
-      const restoredCalibrationSource = value.calibrationSource === "manual" || value.calibrationSource === "two-point" || value.calibrationSource === "ruler-fit"
-        ? value.calibrationSource
-        : "manual";
+      const restoredCalibrationSource: SpatialCalibrationSource = value.calibrationSource === "two-point"
+        ? "two-point"
+        : value.calibrationSource === "ruler-fit" || value.calibrationSource === "physical-ruler-overlay"
+          ? "physical-ruler-overlay"
+          : value.calibrationSource === "physical-ruler-perspective"
+            ? "physical-ruler-perspective"
+            : "manual-scale";
       setCalibrationSource(restoredCalibrationSource);
+      const physicalRulerCalibration = restoredCalibrationSource === "physical-ruler-overlay" ||
+        restoredCalibrationSource === "physical-ruler-perspective";
       setCalibrationStale(
         (typeof value.calibrationStale === "boolean" && value.calibrationStale) ||
-        (restoredCalibrationSource === "ruler-fit" && sourceMode === "simulator"),
+        physicalRulerCalibration,
       );
+      if (physicalRulerCalibration) setRulerDetectionState("stale");
       if (typeof value.rulerFitConfidence === "number") setRulerFitConfidence(value.rulerFitConfidence);
+      if (typeof value.twoPointDistanceMm === "number" && value.twoPointDistanceMm > 0) setTwoPointDistanceMm(value.twoPointDistanceMm);
+      if (typeof value.manualOriginMm === "number") setManualOriginMm(value.manualOriginMm);
+      if (typeof value.tickSnapEnabled === "boolean") setTickSnapEnabled(value.tickSnapEnabled);
+      if (typeof value.numberSnapEnabled === "boolean") setNumberSnapEnabled(value.numberSnapEnabled);
+      if (["auto", "light-on-dark", "dark-on-light", "cyan", "magenta"].includes(String(value.rulerContrastMode))) {
+        setRulerContrastMode(value.rulerContrastMode as RulerContrastMode);
+      }
+      if (value.rulerDetection && typeof value.rulerDetection === "object") {
+        const candidate = value.rulerDetection as Partial<RulerDetectionResult>;
+        if (candidate.schema === "fringelab.ruler-detection.v1" && candidate.fit && Array.isArray(candidate.ticks)) {
+          setRulerDetection(candidate as RulerDetectionResult);
+        }
+      }
       if (value.ruler && typeof value.ruler === "object") {
         const candidate = value.ruler as Partial<RulerCalibration>;
         if (
@@ -1428,7 +1841,10 @@ export default function FringeLab() {
       if (value.orientation === "vertical" || value.orientation === "horizontal") {
         setOrientation(value.orientation);
       }
-      setToast("已恢复本机实验参数");
+      setCanvasInteractionMode("roi");
+      setToast(physicalRulerCalibration
+        ? "已恢复参数；原图片未随会话保存，实物标尺标定已标记为 STALE"
+        : "已恢复本机实验参数");
     } catch {
       setToast("本地会话格式无效");
     }
@@ -1444,11 +1860,15 @@ export default function FringeLab() {
     setReferenceWavelengthNm(wavelengthNm);
     setChannel("auto");
     setMmPerPixel(0.02);
-    setCalibrationSource("manual");
+    setCalibrationSource("manual-scale");
     setCalibrationStale(false);
     setRulerMode(false);
     setRuler(DEFAULT_RULER);
     setRulerFitConfidence(null);
+    setRulerDetection(null);
+    setRulerDetectionState("idle");
+    setCanvasInteractionMode("roi");
+    setImageLoaded(false);
     setScreenDistanceM(1.5);
     setSlitWidthMm(mode === "double" ? 0.04 : 0.12);
     setSlitSeparationMm(0.25);
@@ -1473,11 +1893,23 @@ export default function FringeLab() {
   const hasManualExposure = Boolean(cameraSnapshot?.capabilities.exposureMode?.includes("manual"));
   const calibrationSourceLabel = calibrationStale
     ? "STALE"
-    : calibrationSource === "ruler-fit" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
+    : calibrationSource === "physical-ruler-perspective"
+      ? "RULER H"
+      : calibrationSource === "physical-ruler-overlay" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
   const currentRulerLengthPx = rulerLengthPx(ruler);
   const currentRulerScale = rulerMmPerPixel(ruler);
   const rulerCanApply = Number.isFinite(currentRulerLengthPx) &&
-    currentRulerLengthPx >= MIN_RULER_LENGTH_PX && currentRulerScale != null;
+    currentRulerLengthPx >= MIN_RULER_LENGTH_PX && currentRulerScale != null &&
+    ((rulerDetection?.fit.confidence ?? 1) >= 0.55 || lowConfidenceConfirmed);
+  const rulerSourceReady = sourceMode === "image"
+    ? imageLoaded
+    : sourceMode === "camera" ? cameraSnapshot != null : false;
+  const rulerDetectionStatusLabel = calibrationStale || rulerDetectionState === "stale"
+    ? "已失效"
+    : rulerDetectionState === "detecting" ? "识别中"
+      : rulerDetectionState === "candidate" ? "待确认"
+        : rulerDetectionState === "applied" ? "已应用"
+          : rulerDetectionState === "failed" ? "未识别" : "未识别";
 
   return (
     <main className="lab-app">
@@ -1576,6 +2008,91 @@ export default function FringeLab() {
                   <div className="micro-card-value"><span>{formatNumber(analysis?.dynamicRange ?? null, 1)} DN</span><span>SAT {formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%</span></div>
                 </div>
               </div>
+              <details
+                className={`ruler-fit-panel ${rulerDetectionState}`}
+                open={sourceMode !== "simulator" && rulerPanelOpen}
+                onToggle={(event) => setRulerPanelOpen(event.currentTarget.open)}
+              >
+                <summary>
+                  <span><strong>标尺套合</strong><small>RULER FIT</small></span>
+                  <span className={`ruler-state ${rulerDetectionState}`}>{sourceMode === "simulator" ? "无需标定" : rulerDetectionStatusLabel}</span>
+                </summary>
+                <div className="ruler-fit-body">
+                    {sourceMode === "simulator"
+                      ? <div className="notice">仿真图样已有已知空间比例，无需实物标尺标定。</div>
+                      : !rulerSourceReady ? <div className="notice warn">请先连接摄像头或载入实验图片，之后才能识别实物刻度尺。</div> : null}
+                    <div className="button-row">
+                      <button
+                        type="button"
+                        className="button primary"
+                        disabled={!rulerSourceReady || rulerDetectionState === "detecting"}
+                        onClick={() => runPhysicalRulerDetection()}
+                        title="Detect Physical Ruler"
+                      >
+                        自动识别刻度尺
+                      </button>
+                      <button type="button" className="button" disabled={!rulerSourceReady || rulerDetectionState === "detecting"} onClick={startRulerRegionSelection} title="Select Ruler Region">框选实物尺</button>
+                      <button type="button" className={`button ${rulerMode && !rulerDetection ? "warn" : ""}`} disabled={!rulerSourceReady || rulerDetectionState === "detecting"} onClick={toggleRulerFit}>手动套合</button>
+                      {rulerDetectionState === "detecting" ? <button type="button" className="button danger" onClick={cancelRulerDetection}>取消识别</button> : null}
+                    </div>
+                    {rulerDetectionState === "detecting" ? (
+                      <div className="ruler-progress" role="status" aria-live="polite">
+                        <span style={{ width: `${rulerDetectionProgress}%` }} />
+                        <small>正在本机分析尺体方向、边缘和毫米刻线… {rulerDetectionProgress}%</small>
+                      </div>
+                    ) : null}
+                    <div className="ruler-options">
+                      <label>
+                        <span>显示模式</span>
+                        <select value={rulerContrastMode} onChange={(event) => setRulerContrastMode(event.currentTarget.value as RulerContrastMode)}>
+                          <option value="auto">自动对比</option>
+                          <option value="dark-on-light">深色刻线</option>
+                          <option value="light-on-dark">浅色刻线</option>
+                          <option value="cyan">青色</option>
+                          <option value="magenta">品红色</option>
+                        </select>
+                      </label>
+                      <label className="check-option"><input type="checkbox" checked={tickSnapEnabled} onChange={(event) => setTickSnapEnabled(event.currentTarget.checked)} />刻线磁吸</label>
+                      <label className="check-option"><input type="checkbox" checked={numberSnapEnabled} onChange={(event) => setNumberSnapEnabled(event.currentTarget.checked)} />数字磁吸</label>
+                    </div>
+                    <div className="ruler-manual-grid">
+                      <label>
+                        <span>虚拟尺实际区间</span>
+                        <span className="compact-number"><input type="number" min="0.001" step="0.1" value={ruler.knownLengthMm} onChange={(event) => { const value = Math.max(0.001, Number(event.currentTarget.value)); setRuler((current) => ({ ...current, knownLengthMm: value })); }} /><em>mm</em></span>
+                      </label>
+                      <label>
+                        <span>起始刻度（OCR 回退）</span>
+                        <span className="compact-number"><input type="number" step="1" value={manualOriginMm} onChange={(event) => { const value = Number(event.currentTarget.value); setManualOriginMm(value); setRuler((current) => ({ ...current, originMm: value })); }} /><em>mm</em></span>
+                      </label>
+                    </div>
+                    {(rulerDetection || rulerMode) ? (
+                      <div className="ruler-console" aria-label="毫米标尺套合控制">
+                        <div className="ruler-readout">
+                          <span><small>实物区间</small>{ruler.knownLengthMm.toFixed(1)} mm</span>
+                          <span><small>像素长度</small>{currentRulerLengthPx.toFixed(1)} px</span>
+                          <span><small>空间比例</small>{currentRulerScale?.toFixed(5) ?? "—"} mm/px</span>
+                          <span><small>尺体角度</small>{rulerAngleDeg(ruler).toFixed(1)}°</span>
+                          <span><small>有效刻线</small>{rulerDetection ? `${rulerDetection.fit.inlierCount} / ${rulerDetection.fit.totalCount}` : "手动"}</span>
+                          <span><small>平均残差</small>{rulerDetection ? `${rulerDetection.fit.residualRmsPx.toFixed(2)} px` : "—"}</span>
+                          <span><small>OCR 数字</small>{rulerDetection?.numbers.length ? rulerDetection.numbers.map((item) => item.text).join(" ") : "未确认"}</span>
+                          <span><small>综合置信度</small>{rulerFitConfidence != null ? `${(rulerFitConfidence * 100).toFixed(0)}%` : "手动"}</span>
+                        </div>
+                        {rulerDetection ? <div className="ruler-confidence">{rulerDetection.message}</div> : null}
+                        {rulerDetection?.perspectiveWarning ? <div className="notice warn">{rulerDetection.perspectiveWarning}</div> : null}
+                        {rulerDetection && rulerDetection.fit.confidence < 0.55 ? (
+                          <label className="check-option low-confidence"><input type="checkbox" checked={lowConfidenceConfirmed} onChange={(event) => setLowConfidenceConfirmed(event.currentTarget.checked)} />我已人工核对刻线重合，允许应用低置信度结果</label>
+                        ) : null}
+                        <div className="button-row">
+                          <button type="button" className="button" disabled={!rulerDetection} onClick={() => runPhysicalRulerDetection(rulerDetection?.selectedRegion)}>重新识别</button>
+                          <button type="button" className="button" disabled={!rulerMode} onClick={smartSnapRuler}>重新吸附</button>
+                          <button type="button" className="button" onClick={cancelRulerDetection}>取消</button>
+                          <button type="button" className="button primary" disabled={!rulerCanApply} onClick={applyRulerCalibration}>应用标定</button>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="ruler-footnote">刻线周期决定比例；数字只用于确认绝对起点。按住 Alt/Option 可临时关闭磁吸。刻度尺应与光屏同平面。</div>
+                </div>
+              </details>
             </div>
           </article>
 
@@ -1727,59 +2244,40 @@ export default function FringeLab() {
               </div>
               <FieldNumber label="空间比例" value={mmPerPixel} unit="mm/px" min={0.00001} step={0.00001} onChange={setManualScale} />
               <FieldNumber
-                label="标尺实际区间"
-                value={ruler.knownLengthMm}
+                label="两点实际距离"
+                value={twoPointDistanceMm}
                 unit="mm"
                 min={0.001}
                 step={0.1}
-                onChange={(value) => setRuler((current) => ({ ...current, knownLengthMm: value }))}
+                onChange={setTwoPointDistanceMm}
               />
               <FieldNumber label="标定相对不确定度" value={calibrationUncertaintyPct} unit="%" min={0} step={0.1} onChange={setCalibrationUncertaintyPct} />
               <FieldNumber label="高斯平滑 σ" value={smoothingSigma} unit="px" min={0} max={10} step={0.1} onChange={setSmoothingSigma} />
             </div>
             <div className="button-row space-top-md">
-              <button type="button" className={`button ${calibrationMode ? "warn" : ""}`} onClick={() => { setRulerMode(false); setCalibrationMode((value) => !value); setCalibrationPoints([]); }}>
+              <button type="button" className={`button ${calibrationMode ? "warn" : ""}`} onClick={() => {
+                const next = !calibrationMode;
+                setRulerMode(false);
+                setCalibrationMode(next);
+                setCanvasInteractionMode(next ? "two-point-calibration" : "roi");
+                setCalibrationPoints([]);
+              }}>
                 {calibrationMode ? "取消标定" : "两点标定"}
-              </button>
-              <button
-                type="button"
-                className={`button ${rulerMode ? "warn" : "primary"}`}
-                disabled={sourceMode === "simulator"}
-                title={sourceMode === "simulator" ? "标尺套合用于摄像头或实验图片" : "将虚拟毫米尺套合到画面中的真实刻度尺"}
-                onClick={toggleRulerFit}
-              >
-                {rulerMode ? "取消套合" : "标尺套合"}
               </button>
               <button type="button" className="button" onClick={() => setRoi(DEFAULT_ROI)}>重置 ROI</button>
               <button type="button" className="button" onClick={freezeCurrentFrame}>冻结当前帧</button>
             </div>
-            {rulerMode ? (
-              <div className="ruler-console space-top-sm" aria-label="毫米标尺套合控制">
-                <div className="ruler-readout">
-                  <span><small>实际区间</small>{ruler.knownLengthMm.toFixed(1)} mm</span>
-                  <span><small>像素长度</small>{currentRulerLengthPx.toFixed(1)} px</span>
-                  <span><small>比例</small>{currentRulerScale?.toFixed(5) ?? "—"} mm/px</span>
-                  <span><small>角度</small>{rulerAngleDeg(ruler).toFixed(1)}°</span>
-                </div>
-                <div className="button-row">
-                  <button type="button" className="button" onClick={smartSnapRuler}>智能吸附</button>
-                  <button type="button" className="button primary" disabled={!rulerCanApply} onClick={applyRulerCalibration}>应用标定</button>
-                </div>
-                {rulerFitConfidence != null ? <div className="ruler-confidence">吸附建议置信度 {(rulerFitConfidence * 100).toFixed(0)}% · 请人工确认刻度重合</div> : null}
-              </div>
-            ) : null}
             <div className={`notice space-top-sm ${calibrationMode || rulerMode || calibrationStale ? "warn" : ""}`}>
               {rulerMode
-                ? "拖动标尺主体平移，拖动两端控制点改变长度与角度；按住 Shift 可吸附到 0°/45°/90°。"
+                ? "标尺套合正在光学画面下方的 RULER FIT 面板中进行。"
                 : calibrationMode
-                  ? `请在画面标尺上依次点击两端，实际距离设为 ${ruler.knownLengthMm} mm。`
+                  ? `两点标定：请在画面上依次点击两点，实际距离设为 ${twoPointDistanceMm} mm。`
                   : calibrationStale
-                    ? "输入源已经变化，原标尺比例可能失效，请重新执行标尺套合或手动标定。"
+                    ? "输入源已经变化，原实物标尺比例已失效；请在光学画面的 RULER FIT 中重新识别，或使用手动/两点标定。"
                     : sourceMode === "simulator"
-                      ? "拖动 ROI 内部改变位置；拖动四角方块调整长宽。标尺套合用于摄像头或实验图片。"
-                      : "拖动 ROI 内部改变位置；拖动四角调整长宽；需要真实尺寸时可使用标尺套合。"}
+                      ? "拖动 ROI 内部改变位置；拖动四角方块调整长宽。仿真使用已知空间比例。"
+                      : "这里保留 ROI、手动比例和两点标定；实物标尺套合位于左上光学画面下方。"}
             </div>
-            {rulerMode ? <div className="notice space-top-xs">刻度尺必须与光斑处于同一光屏平面并尽量靠近 ROI。明显透视或不同深度会使全局 mm/px 失效。</div> : null}
             <div className="button-row space-top-sm">
               <button type="button" className="button" disabled={!analysis} onClick={() => { setBackground(analysis?.raw ?? null); setToast("已采集当前 ROI 为背景"); }}>采集背景</button>
               <button type="button" className="button" disabled={!background} onClick={() => setBackground(null)}>清除背景</button>
