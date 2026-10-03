@@ -59,6 +59,10 @@ export interface StripProfileResult {
   readonly axisPositionsPx: Float64Array;
   /** Number of valid source samples averaged into each profile bin. */
   readonly samplesPerBin: Uint32Array;
+  /** Fraction clipped in each bin, measured before background subtraction. */
+  readonly saturationProfiles: Readonly<Record<ProfileChannel, Float64Array>>;
+  readonly laserColor: "r" | "g" | "b" | null;
+  readonly channelReason: string;
 }
 
 export interface PeriodEstimationOptions {
@@ -615,6 +619,10 @@ export function extractStripProfile(
   const blue = new Float64Array(profileCount);
   const luminance = new Float64Array(profileCount);
   const samplesPerBin = new Uint32Array(profileCount);
+  const saturationProfiles: Record<ProfileChannel, Float64Array> = {
+    r: new Float64Array(profileCount), g: new Float64Array(profileCount),
+    b: new Float64Array(profileCount), luminance: new Float64Array(profileCount),
+  };
   const saturatedCounts: Record<ProfileChannel, number> = { r: 0, g: 0, b: 0, luminance: 0 };
   let totalSamples = 0;
 
@@ -639,12 +647,13 @@ export function extractStripProfile(
       luminance[profileIndex] += lum;
       samplesPerBin[profileIndex] += 1;
       totalSamples += 1;
-      if (r >= saturationThreshold) saturatedCounts.r += 1;
-      if (g >= saturationThreshold) saturatedCounts.g += 1;
-      if (b >= saturationThreshold) saturatedCounts.b += 1;
+      if (r >= saturationThreshold) { saturatedCounts.r += 1; saturationProfiles.r[profileIndex] += 1; }
+      if (g >= saturationThreshold) { saturatedCounts.g += 1; saturationProfiles.g[profileIndex] += 1; }
+      if (b >= saturationThreshold) { saturatedCounts.b += 1; saturationProfiles.b[profileIndex] += 1; }
       // Luminance inherits clipping from any contributing source channel.
       if (r >= saturationThreshold || g >= saturationThreshold || b >= saturationThreshold) {
         saturatedCounts.luminance += 1;
+        saturationProfiles.luminance[profileIndex] += 1;
       }
     }
     const count = samplesPerBin[profileIndex];
@@ -653,6 +662,7 @@ export function extractStripProfile(
       green[profileIndex] /= count;
       blue[profileIndex] /= count;
       luminance[profileIndex] /= count;
+      for (const channel of ["r", "g", "b", "luminance"] as const) saturationProfiles[channel][profileIndex] /= count;
     }
   }
 
@@ -673,9 +683,46 @@ export function extractStripProfile(
   }
 
   const requestedChannel = options.channel ?? "auto";
+  // Colour contrast determines fringe polarity. A camera's tone mapping can
+  // make G decrease at red fringes; low clipping in G alone is not evidence
+  // that its maxima represent bright fringes.
+  const rgb = ["r", "g", "b"] as const;
+  const chromaCandidates = rgb.map((color) => {
+    const others = rgb.filter((candidate) => candidate !== color);
+    const excess = Float64Array.from(profiles[color], (value, index) =>
+      value - (profiles[others[0]][index] + profiles[others[1]][index]) / 2);
+    return { color, amplitude: quantile(excess, 0.95) - quantile(excess, 0.05),
+      positive: quantile(excess, 0.85) };
+  }).filter((item) => item.positive > 10 && item.amplitude > 10 && dynamicRanges[item.color] >= 2)
+    .sort((a, b) => b.amplitude - a.amplitude);
+  const laserColor = chromaCandidates[0]?.color ?? null;
+  let channelReason = "按对比度与噪声选择通道";
   let selectedChannel: ProfileChannel;
   if (requestedChannel !== "auto") {
     selectedChannel = requestedChannel;
+    channelReason = "手动选择通道；请核对峰与原图亮纹对应";
+  } else if (laserColor) {
+    selectedChannel = laserColor;
+    channelReason = `检测到${laserColor === "r" ? "红" : laserColor === "g" ? "绿" : "蓝"}色条纹，保留亮纹极性`;
+    if (saturationRates[laserColor] > 0.005) {
+      const primary = profiles[laserColor];
+      const meanPrimary = primary.reduce((sum, value) => sum + value, 0) / primary.length;
+      const aligned = rgb.filter((color) => {
+        if (color === laserColor || saturationRates[color] > .005 || dynamicRanges[color] < 2) return false;
+        const candidate = profiles[color];
+        const meanCandidate = candidate.reduce((sum, value) => sum + value, 0) / candidate.length;
+        let covariance = 0; let primaryEnergy = 0; let candidateEnergy = 0;
+        for (let i = 0; i < primary.length; i++) {
+          const a = primary[i] - meanPrimary; const b = candidate[i] - meanCandidate;
+          covariance += a * b; primaryEnergy += a * a; candidateEnergy += b * b;
+        }
+        return covariance / Math.sqrt(Math.max(Number.EPSILON, primaryEnergy * candidateEnergy)) >= .8;
+      });
+      if (aligned.length) {
+        selectedChannel = aligned.reduce((best, color) => contrastScores[color] > contrastScores[best] ? color : best);
+        channelReason += `；使用已验证同向的 ${selectedChannel.toUpperCase()} 通道`;
+      } else channelReason += "；主色过曝，位置结果仅作暂估";
+    }
   } else {
     const maxSaturation = options.maxAutoSaturationRate ?? 0.005;
     const minimumContrast = options.minAutoContrast ?? 2;
@@ -707,6 +754,9 @@ export function extractStripProfile(
     axis: orientation === "vertical" ? "x" : "y",
     axisPositionsPx,
     samplesPerBin,
+    saturationProfiles,
+    laserColor,
+    channelReason,
   };
 }
 

@@ -724,12 +724,12 @@ export function detectPhysicalRuler(
   const structuralPeriods: number[] = [];
   for (let index = 1; index < majorPositions.length; index += 1) {
     const estimate = (majorPositions[index] - majorPositions[index - 1]) / 10;
-    if (estimate >= 2 && estimate <= 24) structuralPeriods.push(estimate);
+    if (estimate >= 2 && estimate <= Math.max(24, image.width / 30)) structuralPeriods.push(estimate);
   }
   const mediumPositions = positions.filter((_, index) => classified[index] !== "minor");
   for (let index = 1; index < mediumPositions.length; index += 1) {
     const estimate = (mediumPositions[index] - mediumPositions[index - 1]) / 5;
-    if (estimate >= 2 && estimate <= 24) structuralPeriods.push(estimate);
+    if (estimate >= 2 && estimate <= Math.max(24, image.width / 30)) structuralPeriods.push(estimate);
   }
   const structuralPeriod = structuralPeriods.length >= 2 ? median(structuralPeriods) : null;
   const structuralRatio = structuralPeriod && profilePeriod ? structuralPeriod / profilePeriod : null;
@@ -767,7 +767,9 @@ export function detectPhysicalRuler(
   const themeRuler: RulerCalibration = { start, end, knownLengthMm, tickSide };
   const contrastMode = options.contrastMode ?? "auto";
   const theme = resolveRulerTheme(image, themeRuler, contrastMode);
-  const variation = perspectiveVariation(positions.filter((_, index) => fit.inliers[index]), fit.pixelsPerMm);
+  // Evaluate all detected ticks, not only globally fitted inliers: rejecting
+  // the ends of a distorted ruler must not make its variation appear zero.
+  const variation = perspectiveVariation(positions, fit.pixelsPerMm);
   const perspectiveWarning = variation > 3
     ? `左右毫米间距变化 ${variation.toFixed(1)}%，存在透视；当前仅警告降级，未进行单应性校正。`
     : null;

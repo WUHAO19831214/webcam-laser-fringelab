@@ -982,6 +982,19 @@ button {
   border-top: 1px solid var(--line);
 }
 
+.real-setup,
+.local-calibration {
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: rgba(99, 230, 209, .035);
+}
+
+.real-setup h3 { margin: 0; font-size: 14px; }
+.anchor-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.anchor-list .button { min-height: 32px; padding: 6px 10px; font-size: 11px; }
+
 .ruler-options {
   display: flex;
   align-items: flex-end;

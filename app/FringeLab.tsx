@@ -19,24 +19,11 @@ import {
   type CameraSnapshot,
 } from "@/lib/camera";
 import { downloadBlob, downloadText, rowsToCsv, timestampSlug } from "@/lib/export";
+import { analyseFrame, type Analysis, type AnalysisConfig } from "@/lib/analysis";
+import { validateSpatialAnchors, type SpatialAnchor } from "@/lib/spatial";
+import { decodeExperimentImage } from "@/lib/image-input";
+import { recognizeRulerReadings } from "@/lib/ruler-ocr";
 import {
-  doubleSlitFresnelNumber,
-  doubleSlitSmallAngleUncertainty,
-  finiteDoubleSlitIntensity,
-  fitDoubleSlitOrders,
-  fitSingleSlitDarkFringes,
-  singleSlitFresnelNumber,
-  singleSlitIntensity,
-  singleSlitSmallAngleUncertainty,
-} from "@/lib/physics";
-import {
-  detectPeaks,
-  detectTroughs,
-  estimatePeriodAutocorrelation,
-  extractStripProfile,
-  gaussianSmooth,
-  subtractBackground,
-  type DetectedExtremum,
   type FringeOrientation,
   type ImageDataLike,
   type RequestedProfileChannel,
@@ -83,12 +70,14 @@ type SourceMode = "simulator" | "camera" | "image";
 type ExperimentMode = "double" | "single";
 type Level = "good" | "warn" | "danger";
 type SpatialCalibrationSource =
+  | "multi-point"
   | "manual-scale"
   | "two-point"
   | "physical-ruler-overlay"
   | "physical-ruler-perspective";
 
 type CanvasInteractionMode =
+  | "multi-point-calibration"
   | "roi"
   | "two-point-calibration"
   | "ruler-region-selection"
@@ -107,55 +96,8 @@ type RulerInteraction =
   | { mode: "move"; startPoint: Point; startRuler: RulerCalibration }
   | { mode: "resize"; handle: "start" | "end"; startRuler: RulerCalibration };
 
-type Mark = DetectedExtremum & {
-  axisPx: number;
-  positionMm: number;
-  order: number | null;
-};
 
-type Analysis = {
-  raw: number[];
-  corrected: number[];
-  smooth: number[];
-  model: number[];
-  axisPx: number[];
-  axisMm: number[];
-  peaks: Mark[];
-  troughs: Mark[];
-  selectedChannel: string;
-  saturationRate: number;
-  dynamicRange: number;
-  periodPx: number | null;
-  fringeSpacingMm: number | null;
-  centralWidthMm: number | null;
-  fwhmMm: number | null;
-  wavelengthNm: number | null;
-  smallAngleNm: number | null;
-  uncertaintyNm: number | null;
-  referenceErrorPct: number | null;
-  smallAngleDifferencePct: number | null;
-  regressionR2: number | null;
-  fresnelNumber: number | null;
-  centralPositionMm: number;
-  status: string;
-};
 
-type AnalysisConfig = {
-  experiment: ExperimentMode;
-  channel: RequestedProfileChannel;
-  orientation: FringeOrientation;
-  roi: Roi;
-  mmPerPixel: number;
-  screenDistanceM: number;
-  slitWidthMm: number;
-  slitSeparationMm: number;
-  apertureUncertaintyMm: number;
-  distanceUncertaintyM: number;
-  calibrationUncertaintyPct: number;
-  referenceWavelengthNm: number;
-  smoothingSigma: number;
-  background: number[] | null;
-};
 
 const FRAME_WIDTH = 960;
 const FRAME_HEIGHT = 540;
@@ -188,33 +130,8 @@ function finiteOr(value: number, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
-function median(values: readonly number[]): number | null {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[middle - 1] + sorted[middle]) / 2
-    : sorted[middle];
-}
 
-function quantile(values: readonly number[], fraction: number): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const position = clamp(fraction, 0, 1) * (sorted.length - 1);
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
-}
 
-function standardDeviation(values: readonly number[]): number {
-  if (values.length < 2) return 0;
-  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-  return Math.sqrt(
-    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-      (values.length - 1),
-  );
-}
 
 function formatNumber(value: number | null, digits = 2, fallback = "—"): string {
   return value == null || !Number.isFinite(value) ? fallback : value.toFixed(digits);
@@ -226,312 +143,7 @@ function levelFor(value: number, goodBelow: number, warnBelow: number): Level {
   return "danger";
 }
 
-function markAtPosition(
-  extremum: DetectedExtremum,
-  axisPx: readonly number[],
-  mmPerPixel: number,
-): Mark {
-  const bounded = clamp(extremum.position, 0, axisPx.length - 1);
-  const lower = Math.floor(bounded);
-  const upper = Math.ceil(bounded);
-  const fraction = bounded - lower;
-  const pixel = axisPx[lower] + (axisPx[upper] - axisPx[lower]) * fraction;
-  return {
-    ...extremum,
-    axisPx: pixel,
-    positionMm: pixel * mmPerPixel,
-    order: null,
-  };
-}
 
-function analyseFrame(image: ImageDataLike, config: AnalysisConfig): Analysis {
-  const extracted = extractStripProfile(image, {
-    channel: config.channel,
-    fringeOrientation: config.orientation,
-    roi: config.roi,
-    saturationThreshold: 250,
-  });
-  const raw = Array.from(extracted.profile);
-  let corrected = config.background?.length === raw.length
-    ? Array.from(subtractBackground(raw, config.background, true))
-    : [...raw];
-  const baseline = quantile(corrected, 0.03);
-  corrected = Array.from(subtractBackground(corrected, baseline, true));
-  const smooth = Array.from(gaussianSmooth(corrected, config.smoothingSigma));
-  const p05 = quantile(smooth, 0.05);
-  const p95 = quantile(smooth, 0.95);
-  const dynamicRange = Math.max(0, p95 - p05);
-  const periodEstimate = estimatePeriodAutocorrelation(smooth, {
-    minLag: 8,
-    maxLag: Math.max(12, Math.floor(smooth.length / 3)),
-    minCorrelation: 0.1,
-  });
-  const periodPx = periodEstimate.period;
-  const minDistance = periodPx == null ? 10 : Math.max(7, periodPx * 0.56);
-  const prominence = Math.max(1.5, dynamicRange * 0.07);
-  const peakCandidates = detectPeaks(smooth, {
-    minProminence: prominence,
-    minDistance,
-    maxPeaks: 17,
-    saturationThreshold: 248,
-    plateauTolerance: 0.0001,
-  });
-  const troughCandidates = detectTroughs(smooth, {
-    minProminence: config.experiment === "single"
-      ? Math.max(0.1, dynamicRange * 0.015)
-      : Math.max(1, prominence * 0.6),
-    minDistance: Math.max(6, minDistance * 0.58),
-    maxPeaks: 18,
-    plateauTolerance: 0.0001,
-  });
-  const axisPx = Array.from(extracted.axisPositionsPx);
-  let peaks = peakCandidates.map((peak) => markAtPosition(peak, axisPx, config.mmPerPixel));
-  let troughs = troughCandidates.map((trough) => markAtPosition(trough, axisPx, config.mmPerPixel));
-  const centralPeak = peaks.reduce<Mark | null>((best, current) => {
-    if (best == null) return current;
-    const score = current.value + current.prominence * 0.35 - Math.abs(current.axisPx) * 0.003;
-    const bestScore = best.value + best.prominence * 0.35 - Math.abs(best.axisPx) * 0.003;
-    return score > bestScore ? current : best;
-  }, null);
-  const centralPositionMm = centralPeak?.positionMm ?? 0;
-
-  let fringeSpacingMm: number | null = null;
-  let centralWidthMm: number | null = null;
-  let fwhmMm: number | null = null;
-  let wavelengthNm: number | null = null;
-  let smallAngleNm: number | null = null;
-  let uncertaintyNm: number | null = null;
-  let regressionR2: number | null = null;
-  let status = "等待可用条纹";
-
-  if (centralPeak?.width != null) {
-    fwhmMm = centralPeak.width * config.mmPerPixel;
-  }
-
-  if (config.experiment === "double" && peaks.length >= 2) {
-    const spacings = peaks
-      .slice(1)
-      .map((peak, index) => peak.positionMm - peaks[index].positionMm)
-      .filter((spacing) => spacing > config.mmPerPixel * 3);
-    fringeSpacingMm = median(spacings) ?? (periodPx == null ? null : periodPx * config.mmPerPixel);
-    if (fringeSpacingMm != null && centralPeak != null) {
-      peaks = peaks.map((peak) => ({
-        ...peak,
-        order: Math.round((peak.positionMm - centralPositionMm) / fringeSpacingMm!),
-      }));
-      const byOrder = new Map<number, Mark>();
-      for (const peak of peaks) {
-        if (peak.order == null || peak.saturated) continue;
-        const previous = byOrder.get(peak.order);
-        if (previous == null || peak.prominence > previous.prominence) byOrder.set(peak.order, peak);
-      }
-      const observations = [...byOrder.values()]
-        .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
-        .map((peak) => ({
-          order: peak.order ?? 0,
-          screenPositionM: peak.positionMm / 1000,
-        }));
-      if (observations.length >= 3) {
-        try {
-          const regression = fitDoubleSlitOrders({
-            observations,
-            screenDistanceM: config.screenDistanceM,
-            slitSeparationM: config.slitSeparationMm / 1000,
-            centerPositionM: centralPositionMm / 1000,
-          });
-          wavelengthNm = regression.wavelengthM * 1e9;
-          regressionR2 = regression.rSquared;
-          status = `多级亮纹精确回归（${observations.length} 点）`;
-        } catch {
-          // The small-angle fallback below remains available for sparse/noisy data.
-        }
-      }
-      smallAngleNm =
-        (config.slitSeparationMm * fringeSpacingMm * 1e-6) /
-        config.screenDistanceM * 1e9;
-      if (wavelengthNm == null) {
-        wavelengthNm = smallAngleNm;
-        status = "相邻亮纹间距（小角近似）";
-      }
-      const spacingScatter = standardDeviation(spacings) / Math.sqrt(Math.max(1, spacings.length));
-      const spacingUncertaintyMm = Math.hypot(
-        Math.max(config.mmPerPixel / Math.sqrt(12), spacingScatter),
-        fringeSpacingMm * config.calibrationUncertaintyPct / 100,
-      );
-      try {
-        const uncertainty = doubleSlitSmallAngleUncertainty({
-          slitSeparationM: {
-            value: config.slitSeparationMm / 1000,
-            standardUncertainty: config.apertureUncertaintyMm / 1000,
-          },
-          fringeSpacingM: {
-            value: fringeSpacingMm / 1000,
-            standardUncertainty: spacingUncertaintyMm / 1000,
-          },
-          screenDistanceM: {
-            value: config.screenDistanceM,
-            standardUncertainty: config.distanceUncertaintyM,
-          },
-        });
-        uncertaintyNm = uncertainty.standardUncertaintyM * 1e9 * 1.96;
-      } catch {
-        uncertaintyNm = null;
-      }
-    }
-  }
-
-  if (config.experiment === "single" && centralPeak != null && troughs.length >= 2) {
-    const left = troughs
-      .filter((trough) => trough.positionMm < centralPositionMm)
-      .sort((a, b) => b.positionMm - a.positionMm);
-    const right = troughs
-      .filter((trough) => trough.positionMm > centralPositionMm)
-      .sort((a, b) => a.positionMm - b.positionMm);
-    const firstLeft = left[0];
-    const firstRight = right[0];
-    if (firstLeft && firstRight) {
-      centralWidthMm = firstRight.positionMm - firstLeft.positionMm;
-      const firstZeroHalfWidth =
-        ((centralPositionMm - firstLeft.positionMm) +
-          (firstRight.positionMm - centralPositionMm)) /
-        2;
-      troughs = troughs.map((trough) => {
-        const relative = trough.positionMm - centralPositionMm;
-        return {
-          ...trough,
-          order: Math.sign(relative) * Math.max(1, Math.round(Math.abs(relative) / firstZeroHalfWidth)),
-        };
-      });
-      const observations = troughs.map((trough) => ({
-        order: trough.order ?? 1,
-        screenPositionM: trough.positionMm / 1000,
-      }));
-      if (observations.length >= 2) {
-        try {
-          const regression = fitSingleSlitDarkFringes({
-            observations,
-            screenDistanceM: config.screenDistanceM,
-            slitWidthM: config.slitWidthMm / 1000,
-            centerPositionM: centralPositionMm / 1000,
-          });
-          wavelengthNm = regression.wavelengthM * 1e9;
-          regressionR2 = regression.rSquared;
-          status = `多级暗纹精确回归（${observations.length} 点）`;
-        } catch {
-          // The first-zero result below remains available.
-        }
-      }
-      smallAngleNm =
-        (config.slitWidthMm * centralWidthMm * 1e-6) /
-        (2 * config.screenDistanceM) * 1e9;
-      if (wavelengthNm == null) {
-        wavelengthNm = smallAngleNm;
-        status = "第一暗纹中央宽度（小角近似）";
-      }
-      const widthUncertaintyMm = Math.hypot(
-        config.mmPerPixel * Math.sqrt(2 / 12),
-        centralWidthMm * config.calibrationUncertaintyPct / 100,
-      );
-      try {
-        const uncertainty = singleSlitSmallAngleUncertainty({
-          slitWidthM: {
-            value: config.slitWidthMm / 1000,
-            standardUncertainty: config.apertureUncertaintyMm / 1000,
-          },
-          centralMaximumWidthM: {
-            value: centralWidthMm / 1000,
-            standardUncertainty: widthUncertaintyMm / 1000,
-          },
-          screenDistanceM: {
-            value: config.screenDistanceM,
-            standardUncertainty: config.distanceUncertaintyM,
-          },
-        });
-        uncertaintyNm = uncertainty.standardUncertaintyM * 1e9 * 1.96;
-      } catch {
-        uncertaintyNm = null;
-      }
-    }
-  }
-
-  let fresnelNumber: number | null = null;
-  const modelWavelengthNm = wavelengthNm ?? config.referenceWavelengthNm;
-  try {
-    fresnelNumber = config.experiment === "double"
-      ? doubleSlitFresnelNumber({
-          slitWidthM: config.slitWidthMm / 1000,
-          slitSeparationM: config.slitSeparationMm / 1000,
-          wavelengthM: modelWavelengthNm * 1e-9,
-          screenDistanceM: config.screenDistanceM,
-        })
-      : singleSlitFresnelNumber({
-          slitWidthM: config.slitWidthMm / 1000,
-          wavelengthM: modelWavelengthNm * 1e-9,
-          screenDistanceM: config.screenDistanceM,
-        });
-  } catch {
-    fresnelNumber = null;
-  }
-
-  const idealModel = axisPx.map((positionPx) => {
-    const screenPositionM = positionPx * config.mmPerPixel / 1000;
-    const centerPositionM = centralPositionMm / 1000;
-    try {
-      return config.experiment === "double"
-        ? finiteDoubleSlitIntensity({
-            screenPositionM,
-            centerPositionM,
-            screenDistanceM: config.screenDistanceM,
-            wavelengthM: modelWavelengthNm * 1e-9,
-            slitWidthM: config.slitWidthMm / 1000,
-            slitSeparationM: config.slitSeparationMm / 1000,
-          })
-        : singleSlitIntensity({
-            screenPositionM,
-            centerPositionM,
-            screenDistanceM: config.screenDistanceM,
-            wavelengthM: modelWavelengthNm * 1e-9,
-            slitWidthM: config.slitWidthMm / 1000,
-          });
-    } catch {
-      return 0;
-    }
-  });
-
-  return {
-    raw,
-    corrected,
-    smooth,
-    model: normalizeChartSeries(idealModel),
-    axisPx,
-    axisMm: axisPx.map((value) => value * config.mmPerPixel),
-    peaks,
-    troughs,
-    selectedChannel: extracted.selectedChannel,
-    saturationRate: extracted.saturationRates[extracted.selectedChannel],
-    dynamicRange,
-    periodPx,
-    fringeSpacingMm,
-    centralWidthMm,
-    fwhmMm,
-    wavelengthNm,
-    smallAngleNm,
-    uncertaintyNm,
-    referenceErrorPct:
-      wavelengthNm == null
-        ? null
-        : Math.abs(wavelengthNm - config.referenceWavelengthNm) /
-          config.referenceWavelengthNm * 100,
-    smallAngleDifferencePct:
-      wavelengthNm == null || smallAngleNm == null
-        ? null
-        : Math.abs(wavelengthNm - smallAngleNm) / wavelengthNm * 100,
-    regressionR2,
-    fresnelNumber,
-    centralPositionMm,
-    status,
-  };
-}
 
 function drawContained(
   context: CanvasRenderingContext2D,
@@ -604,6 +216,7 @@ export default function FringeLab() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const lastFrameRef = useRef(0);
@@ -623,6 +236,20 @@ export default function FringeLab() {
   const [slitWidthMm, setSlitWidthMm] = useState(0.04);
   const [slitSeparationMm, setSlitSeparationMm] = useState(0.25);
   const [referenceWavelengthNm, setReferenceWavelengthNm] = useState(650);
+  const [hasReference, setHasReference] = useState(false);
+  const [slitWidthKnown, setSlitWidthKnown] = useState(false);
+  const [parametersConfirmed, setParametersConfirmed] = useState(false);
+  const [sourceRevision, setSourceRevision] = useState(0);
+  const [imageLoading, setImageLoading] = useState(false);
+  const [sourceResolution, setSourceResolution] = useState("960×540");
+  const [sourceFilename, setSourceFilename] = useState<string | null>(null);
+  const [captureSettings, setCaptureSettings] = useState<CameraSnapshot | null>(null);
+  const [spatialAnchors, setSpatialAnchors] = useState<SpatialAnchor[]>([]);
+  const [draftAnchors, setDraftAnchors] = useState<SpatialAnchor[]>([]);
+  const [anchorReading, setAnchorReading] = useState(0);
+  const [rulerUnit, setRulerUnit] = useState<"cm" | "mm">("cm");
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrMessage, setOcrMessage] = useState("");
   const [apertureUncertaintyMm, setApertureUncertaintyMm] = useState(0.002);
   const [distanceUncertaintyM, setDistanceUncertaintyM] = useState(0.005);
   const [calibrationUncertaintyPct, setCalibrationUncertaintyPct] = useState(1);
@@ -680,6 +307,10 @@ export default function FringeLab() {
     referenceWavelengthNm,
     smoothingSigma,
     background,
+    spatialAnchors: calibrationSource === "multi-point" ? spatialAnchors : [],
+    hasReference: sourceMode === "simulator" || hasReference,
+    slitWidthKnown: sourceMode === "simulator" || experiment === "single" || slitWidthKnown,
+    measurementReady: sourceMode === "simulator" || (parametersConfirmed && !calibrationStale && !imageLoading),
   }), [
     experiment,
     channel,
@@ -695,6 +326,7 @@ export default function FringeLab() {
     referenceWavelengthNm,
     smoothingSigma,
     background,
+    spatialAnchors, calibrationSource, hasReference, slitWidthKnown, sourceMode, parametersConfirmed, calibrationStale, imageLoading,
   ]);
 
   const processCurrentCanvas = useCallback(() => {
@@ -702,13 +334,29 @@ export default function FringeLab() {
     const context = canvas?.getContext("2d", { willReadFrequently: true });
     if (!canvas || !context) return;
     try {
-      const imageData = context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-      setAnalysis(analyseFrame(imageData, config));
+      const native = sourceMode !== "simulator" ? sourceCanvasRef.current : null;
+      const nativeContext = native?.getContext("2d", { willReadFrequently: true });
+      if (native && nativeContext) {
+        const scale = Math.min(FRAME_WIDTH / native.width, FRAME_HEIGHT / native.height);
+        const offsetX = (FRAME_WIDTH - native.width * scale) / 2;
+        const offsetY = (FRAME_HEIGHT - native.height * scale) / 2;
+        const toNative = (point: Point) => ({ x: (point.x - offsetX) / scale, y: (point.y - offsetY) / scale });
+        const result = analyseFrame(nativeContext.getImageData(0, 0, native.width, native.height), {
+          ...config,
+          roi: { ...config.roi, centerX: toNative({ x: roi.centerX, y: roi.centerY }).x, centerY: toNative({ x: roi.centerX, y: roi.centerY }).y, width: roi.width / scale, height: roi.height / scale },
+          mmPerPixel: config.mmPerPixel * scale,
+          smoothingSigma: config.smoothingSigma / scale,
+          spatialAnchors: config.spatialAnchors?.map((anchor) => ({ ...toNative(anchor), mm: anchor.mm })),
+        });
+        setAnalysis(result);
+      } else {
+        setAnalysis(analyseFrame(context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT), config));
+      }
       setAnalysisError(null);
     } catch (error) {
       setAnalysisError(error instanceof Error ? error.message : "帧分析失败");
     }
-  }, [config]);
+  }, [config, sourceMode, roi]);
 
   const renderSimulator = useCallback(() => {
     const canvas = frameCanvasRef.current;
@@ -783,8 +431,14 @@ export default function FringeLab() {
       const context = canvas?.getContext("2d", { willReadFrequently: true });
       if (canvas && video && context && video.readyState >= 2) {
         drawContained(context, video, video.videoWidth || 1280, video.videoHeight || 720);
-        if (timestamp - lastFrameRef.current > 110) {
+        if (timestamp - lastFrameRef.current > 250) {
           lastFrameRef.current = timestamp;
+          const source = sourceCanvasRef.current ?? document.createElement("canvas");
+          sourceCanvasRef.current = source;
+          source.width = video.videoWidth || 1280;
+          source.height = video.videoHeight || 720;
+          source.getContext("2d", { willReadFrequently: true })?.drawImage(video, 0, 0);
+          setSourceResolution(`${source.width}×${source.height}`);
           processCurrentCanvas();
         }
       }
@@ -794,6 +448,10 @@ export default function FringeLab() {
     return () => {
       if (animationRef.current != null) cancelAnimationFrame(animationRef.current);
     };
+  }, [sourceMode, isFrozen, processCurrentCanvas]);
+
+  useEffect(() => {
+    if (sourceMode === "camera" && isFrozen) processCurrentCanvas();
   }, [sourceMode, isFrozen, processCurrentCanvas]);
 
   useEffect(() => {
@@ -808,7 +466,7 @@ export default function FringeLab() {
       imageRef.current.naturalHeight,
     );
     processCurrentCanvas();
-  }, [sourceMode, processCurrentCanvas]);
+  }, [sourceMode, sourceRevision, processCurrentCanvas]);
 
   useEffect(() => {
     if (!rulerMode) return;
@@ -856,6 +514,22 @@ export default function FringeLab() {
       context.fillRect(point.x - 6, point.y - 6, 12, 12);
       context.fillStyle = "#63e6d1";
       context.fillRect(point.x - 4, point.y - 4, 8, 8);
+    }
+
+    const anchors = canvasInteractionMode === "multi-point-calibration" ? draftAnchors : spatialAnchors;
+    if (anchors.length) {
+      context.save();
+      context.font = "bold 12px monospace";
+      anchors.forEach((point) => {
+        context.strokeStyle = "#071019";
+        context.lineWidth = 5;
+        context.fillStyle = "#59f4e0";
+        context.beginPath(); context.arc(point.x, point.y, 5, 0, Math.PI * 2); context.stroke(); context.fill();
+        const label = `${point.mm} mm`;
+        context.strokeText(label, point.x + 7, point.y - 10);
+        context.fillText(label, point.x + 7, point.y - 10);
+      });
+      context.restore();
     }
 
     if (calibrationPoints.length > 0) {
@@ -1029,6 +703,7 @@ export default function FringeLab() {
     rulerDetection,
     rulerDetectionState,
     snapHighlight,
+    draftAnchors, spatialAnchors, canvasInteractionMode,
   ]);
 
   useEffect(() => {
@@ -1065,8 +740,9 @@ export default function FringeLab() {
       context.moveTo(x, margins.top);
       context.lineTo(x, margins.top + plotHeight);
       context.stroke();
-      const axisIndex = Math.round((analysis.axisMm.length - 1) * index / 6);
-      context.fillText(formatNumber(analysis.axisMm[axisIndex] ?? 0, 1), x - 10, height - 7);
+      const axis = analysis.measurementReady ? analysis.axisMm : analysis.axisPx;
+      const axisIndex = Math.round((axis.length - 1) * index / 6);
+      context.fillText(formatNumber(axis[axisIndex] ?? 0, 1), x - 10, height - 7);
     }
     const toX = (index: number) => margins.left + index / Math.max(1, analysis.raw.length - 1) * plotWidth;
     const toY = (value: number) =>
@@ -1088,7 +764,7 @@ export default function FringeLab() {
       context.setLineDash([]);
     };
     drawLine(rawNormal, "rgba(137,161,183,.35)", 1);
-    if (showModelFit) {
+    if (showModelFit && config.slitWidthKnown && analysis.measurementReady) {
       drawLine(analysis.model, "rgba(255,199,102,.82)", 1.2, [5, 4]);
     }
     drawLine(smoothNormal, "#63e6d1", 1.8);
@@ -1107,7 +783,7 @@ export default function FringeLab() {
       context.lineWidth = 1.3;
       context.strokeRect(x - 2.2, y - 2.2, 4.4, 4.4);
     }
-  }, [analysis, showModelFit]);
+  }, [analysis, showModelFit, config.slitWidthKnown]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1116,10 +792,12 @@ export default function FringeLab() {
   }, [toast]);
 
   const invalidateRulerCalibrationForNewSource = () => {
-    if (calibrationSource === "physical-ruler-overlay" || calibrationSource === "physical-ruler-perspective") {
-      setCalibrationStale(true);
-      setRulerDetectionState("stale");
-    }
+    setCalibrationStale(true);
+    setRulerDetectionState("stale");
+    setBackground(null);
+    setSpatialAnchors([]);
+    setDraftAnchors([]);
+    setOcrMessage("");
     rulerDetectionRequestRef.current += 1;
     rulerWorkerRef.current?.terminate();
     rulerWorkerRef.current = null;
@@ -1141,6 +819,8 @@ export default function FringeLab() {
       invalidateRulerCalibrationForNewSource();
       streamRef.current = result.stream;
       setCameraSnapshot(result.snapshot);
+      setCaptureSettings(result.snapshot);
+      setSourceFilename(null);
       setSourceMode("camera");
       setIsFrozen(false);
       if (videoRef.current) {
@@ -1169,45 +849,51 @@ export default function FringeLab() {
       const snapshot = await lockCurrentCameraSettings(streamRef.current);
       setCameraSnapshot(snapshot);
       const settings = snapshot.settings;
-      setCameraLocked(
-        settings.exposureMode === "manual" ||
-          settings.focusMode === "manual" ||
-          settings.whiteBalanceMode === "manual",
-      );
+      setCameraLocked(settings.exposureMode === "manual");
+      setCaptureSettings(snapshot);
       setToast("已尝试锁定浏览器允许的曝光、对焦和白平衡");
     } catch (error) {
       setCameraError(error instanceof Error ? error.message : "浏览器不允许锁定设置");
     }
   };
 
-  const handleImageUpload = (event: ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     if (!file) return;
     event.currentTarget.value = "";
-    const url = URL.createObjectURL(file);
-    const image = new Image();
-    image.onload = () => {
-      invalidateRulerCalibrationForNewSource();
+    // Invalidate immediately, not after a potentially slow HEIC decode: never
+    // display the previous image's wavelength as the newly selected result.
+    invalidateRulerCalibrationForNewSource();
+    setImageLoading(true);
+    setAnalysisError(null);
+    try {
+      const image = await decodeExperimentImage(file);
       closeCamera(streamRef.current);
       streamRef.current = null;
       setCameraSnapshot(null);
       setCameraLocked(false);
       imageRef.current = image;
+      setSourceFilename(file.name);
+      setCaptureSettings(null);
+      const native = document.createElement("canvas");
+      native.width = image.naturalWidth;
+      native.height = image.naturalHeight;
+      native.getContext("2d", { willReadFrequently: true })?.drawImage(image, 0, 0);
+      sourceCanvasRef.current = native;
+      setSourceResolution(`${native.width}×${native.height}`);
+      setSourceRevision((value) => value + 1);
       setImageLoaded(true);
       setSourceMode("image");
       setIsFrozen(true);
       setToast(`已载入 ${file.name}`);
-      URL.revokeObjectURL(url);
-    };
-    image.onerror = () => {
-      URL.revokeObjectURL(url);
-      setAnalysisError("图片解码失败，请换用 PNG/JPEG/WebP");
-    };
-    image.src = url;
+      setRulerPanelOpen(true);
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : "图片解码失败");
+    } finally { setImageLoading(false); }
   };
 
   const freezeCurrentFrame = () => {
-    const canvas = frameCanvasRef.current;
+    const canvas = sourceMode === "camera" ? sourceCanvasRef.current : frameCanvasRef.current;
     if (!canvas) return;
     const image = new Image();
     image.onload = () => {
@@ -1216,6 +902,12 @@ export default function FringeLab() {
       setCameraSnapshot(null);
       setCameraLocked(false);
       imageRef.current = image;
+      const native = document.createElement("canvas");
+      native.width = image.naturalWidth; native.height = image.naturalHeight;
+      native.getContext("2d", { willReadFrequently: true })?.drawImage(image, 0, 0);
+      sourceCanvasRef.current = native;
+      setSourceResolution(`${native.width}×${native.height}`);
+      setSourceRevision((value) => value + 1);
       setImageLoaded(true);
       setSourceMode("image");
       setIsFrozen(true);
@@ -1244,6 +936,13 @@ export default function FringeLab() {
       setToast("未可靠识别实物刻度尺，请框选尺子区域后重试");
       return;
     }
+    if (result.sourceWidth !== FRAME_WIDTH || result.sourceHeight !== FRAME_HEIGHT) {
+      const scale = Math.min(FRAME_WIDTH / result.sourceWidth, FRAME_HEIGHT / result.sourceHeight);
+      const offsetX = (FRAME_WIDTH - result.sourceWidth * scale) / 2;
+      const offsetY = (FRAME_HEIGHT - result.sourceHeight * scale) / 2;
+      const point = (value: Point) => ({ x: value.x * scale + offsetX, y: value.y * scale + offsetY });
+      result = { ...result, sourceWidth: FRAME_WIDTH, sourceHeight: FRAME_HEIGHT, start: point(result.start), end: point(result.end), rulerBodyCorners: result.rulerBodyCorners.map(point) as [Point, Point, Point, Point], selectedRegion: { x: result.selectedRegion.x * scale + offsetX, y: result.selectedRegion.y * scale + offsetY, width: result.selectedRegion.width * scale, height: result.selectedRegion.height * scale }, ticks: result.ticks.map((tick) => ({ ...tick, point: point(tick.point), axisPositionPx: tick.axisPositionPx * scale, lengthPx: tick.lengthPx * scale })), fit: { ...result.fit, pixelsPerMm: result.fit.pixelsPerMm * scale, mmPerPixel: result.fit.mmPerPixel / scale, offsetPx: result.fit.offsetPx * scale, residualRmsPx: result.fit.residualRmsPx * scale } };
+    }
     const nextRuler = rulerFromDetection(result);
     setRulerDetection(result);
     setRuler(nextRuler);
@@ -1266,7 +965,7 @@ export default function FringeLab() {
       setToast("仿真图样已有已知空间比例，无需实物标尺标定");
       return;
     }
-    const canvas = frameCanvasRef.current;
+    const canvas = sourceCanvasRef.current ?? frameCanvasRef.current;
     const context = canvas?.getContext("2d", { willReadFrequently: true });
     if (!canvas || !context) {
       setToast("当前没有可分析的图像帧");
@@ -1282,16 +981,19 @@ export default function FringeLab() {
     setRulerRegion(selectedRegion ?? null);
     setRulerMode(false);
     setCalibrationMode(false);
-    const imageData = context.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
     const fallbackImageData: ImageDataLike = {
       width: imageData.width,
       height: imageData.height,
       data: new Uint8ClampedArray(imageData.data),
     };
     const sourceType = sourceMode === "camera" ? "camera" : "image";
+    const scale = Math.min(FRAME_WIDTH / canvas.width, FRAME_HEIGHT / canvas.height);
+    const offsetX = (FRAME_WIDTH - canvas.width * scale) / 2;
+    const offsetY = (FRAME_HEIGHT - canvas.height * scale) / 2;
     const options = {
       sourceType,
-      region: selectedRegion,
+      region: selectedRegion ? { x: (selectedRegion.x - offsetX) / scale, y: (selectedRegion.y - offsetY) / scale, width: selectedRegion.width / scale, height: selectedRegion.height / scale } : undefined,
       contrastMode: rulerContrastMode,
       tickSnapEnabled,
       numberSnapEnabled,
@@ -1352,7 +1054,7 @@ export default function FringeLab() {
   };
 
   const updateOverlayCursor = (canvas: HTMLCanvasElement, point: Point) => {
-    if (canvasInteractionMode === "ruler-region-selection" || canvasInteractionMode === "two-point-calibration") {
+    if (canvasInteractionMode === "multi-point-calibration" || canvasInteractionMode === "ruler-region-selection" || canvasInteractionMode === "two-point-calibration") {
       canvas.style.cursor = "crosshair";
       return;
     }
@@ -1376,6 +1078,16 @@ export default function FringeLab() {
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointerPosition(event);
+    if (canvasInteractionMode === "multi-point-calibration") {
+      const mm = anchorReading * (rulerUnit === "cm" ? 10 : 1);
+      if (draftAnchors.some((anchor) => anchor.mm === mm)) {
+        setToast("此读数已存在，请先改变读数或删除旧点");
+        return;
+      }
+      setDraftAnchors((current) => [...current, { ...point, mm }]);
+      setAnchorReading((value) => value + (rulerUnit === "cm" ? 1 : 10));
+      return;
+    }
     if (canvasInteractionMode === "ruler-auto-detection") return;
     if (canvasInteractionMode === "ruler-region-selection") {
       rulerRegionStartRef.current = point;
@@ -1391,6 +1103,7 @@ export default function FringeLab() {
         if (pixelDistance > 1) {
           setMmPerPixel(twoPointDistanceMm / pixelDistance);
           setCalibrationSource("two-point");
+          setSpatialAnchors([]);
           setCalibrationStale(false);
           setCalibrationMode(false);
           setCanvasInteractionMode("roi");
@@ -1646,14 +1359,15 @@ export default function FringeLab() {
       setToast(`标尺至少需要 ${MIN_RULER_LENGTH_PX} px，请拉开两个端点`);
       return;
     }
-    if ((rulerDetection?.fit.confidence ?? 1) < 0.55 && !lowConfidenceConfirmed) {
-      setToast("当前识别置信度较低，请勾选人工核对后再应用");
+    if (rulerDetection && !lowConfidenceConfirmed) {
+      setToast("自动周期可能识别成 5/10 mm 倍频，请核对真实区间和刻线重合后勾选确认");
       return;
     }
     const uncertainty = rulerUncertaintyPct(ruler);
     setMmPerPixel(scale);
     if (uncertainty != null) setCalibrationUncertaintyPct(uncertainty);
     setCalibrationSource("physical-ruler-overlay");
+    setSpatialAnchors([]);
     setCalibrationStale(false);
     setCalibrationPoints([]);
     setRulerMode(false);
@@ -1674,6 +1388,66 @@ export default function FringeLab() {
     setMmPerPixel(value);
     setCalibrationSource("manual-scale");
     setCalibrationStale(false);
+    setSpatialAnchors([]);
+  };
+
+  const startMultiPointCalibration = () => {
+    if (sourceMode === "camera") setIsFrozen(true);
+    setDraftAnchors(spatialAnchors);
+    setAnchorReading(spatialAnchors.length ? Math.max(...spatialAnchors.map((anchor) => anchor.mm)) / (rulerUnit === "cm" ? 10 : 1) + 1 : 0);
+    setCalibrationMode(false);
+    setRulerMode(false);
+    setCanvasInteractionMode("multi-point-calibration");
+    setRulerPanelOpen(true);
+  };
+
+  const applyMultiPointCalibration = () => {
+    const validation = validateSpatialAnchors(draftAnchors);
+    if (!validation.valid) { setToast(validation.reason); return; }
+    const sorted = [...draftAnchors].sort((a, b) => a.mm - b.mm);
+    const first = sorted[0]; const last = sorted[sorted.length - 1];
+    const axisAngle = Math.atan2(last.y - first.y, last.x - first.x);
+    const roiAngle = (roi.angleDeg + (orientation === "horizontal" ? 90 : 0)) * Math.PI / 180;
+    if (Math.abs(Math.cos(axisAngle - roiAngle)) < Math.cos(10 * Math.PI / 180)) {
+      setToast("局部尺标轴与条纹变化方向不平行，请调整 ROI 角度/方向或换用两点比例标定"); return;
+    }
+    setMmPerPixel((last.mm - first.mm) / Math.hypot(last.x - first.x, last.y - first.y));
+    setSpatialAnchors(sorted);
+    setCalibrationSource("multi-point");
+    setCalibrationStale(false);
+    setCanvasInteractionMode("roi");
+    setRulerDetectionState("applied");
+    setToast(`已应用 ${sorted.length} 点局部尺标：分段插值，不是假设整个画面比例恒定`);
+  };
+
+  const runRulerOcr = async () => {
+    const native = sourceCanvasRef.current;
+    if (!native) return;
+    if (!rulerRegion && !rulerDetection) { setToast("请先框选尺子（含数字），再识别数字"); return; }
+    const requestId = rulerDetectionRequestRef.current;
+    const scale = Math.min(FRAME_WIDTH / native.width, FRAME_HEIGHT / native.height);
+    const offsetX = (FRAME_WIDTH - native.width * scale) / 2;
+    const offsetY = (FRAME_HEIGHT - native.height * scale) / 2;
+    const region = rulerRegion ?? rulerDetection!.selectedRegion;
+    const nativeRegion = { x: (region.x - offsetX) / scale, y: (region.y - offsetY) / scale, width: region.width / scale, height: region.height / scale };
+    const toNative = (point: Point) => ({ x: (point.x - offsetX) / scale, y: (point.y - offsetY) / scale });
+    const detection = rulerDetection ? { ...rulerDetection, start: toNative(rulerDetection.start), ticks: rulerDetection.ticks.map((tick) => ({ ...tick, point: toNative(tick.point) })), fit: { ...rulerDetection.fit, pixelsPerMm: rulerDetection.fit.pixelsPerMm / scale } } : null;
+    setOcrBusy(true); setOcrMessage("正在下载/载入本地 OCR 模型并识别数字；图片不会上传。");
+    try {
+      const result = await recognizeRulerReadings(native, nativeRegion, rulerUnit, detection);
+      if (requestId !== rulerDetectionRequestRef.current) return;
+      const anchors = result.anchors.map((anchor) => ({ x: anchor.x * scale + offsetX, y: anchor.y * scale + offsetY, mm: anchor.mm }));
+      setRulerDetection((current) => current ? { ...current, numbers: result.numbers.map((number) => ({ ...number, point: { x: number.point.x * scale + offsetX, y: number.point.y * scale + offsetY }, axisPositionPx: number.axisPositionPx * scale })), ocrStatus: result.numbers.length >= 3 ? "recognized" : result.numbers.length ? "partial" : "not-found" } : current);
+      const validation = validateSpatialAnchors(anchors);
+      if (validation.valid && validation.variationPct < 30) {
+        setDraftAnchors(anchors); setRulerMode(false); setCalibrationMode(false); setCanvasInteractionMode("multi-point-calibration");
+        setOcrMessage(`识别读数 ${result.numbers.map((number) => number.text).join("、")}（${rulerUnit}）。已生成 ${anchors.length} 个候选尺标；请逐个核对数字、单位和刻线位置后应用。`);
+      } else {
+        setOcrMessage(`数字候选：${result.numbers.map((number) => number.text).join("、") || "无"}。未形成可靠刻线对应，请框选更清晰数字区域或使用多点手动标定；未更改比例。`);
+      }
+    } catch {
+      setOcrMessage("OCR 模型载入或识别失败；请检查网络，或使用多点手动标定。原比例未改变。");
+    } finally { setOcrBusy(false); }
   };
 
   const exportCsv = () => {
@@ -1683,7 +1457,7 @@ export default function FringeLab() {
       analysis.raw.map((value, index) => [
         index,
         analysis.axisPx[index],
-        analysis.axisMm[index],
+        analysis.measurementReady ? analysis.axisMm[index] : null,
         value,
         analysis.corrected[index],
         analysis.smooth[index],
@@ -1698,7 +1472,7 @@ export default function FringeLab() {
     downloadText(
       JSON.stringify(
         {
-          schema: "fringelab.measurement.v2",
+          schema: "fringelab.measurement.v3",
           createdAt: new Date().toISOString(),
           terminology: "Relative intensity (camera response, arbitrary units); not lux.",
           configuration: {
@@ -1711,6 +1485,8 @@ export default function FringeLab() {
             spatialCalibration: {
               calibrationMethod: calibrationSource,
               stale: calibrationStale,
+              spatialAnchors,
+              localScaleVariationPct: validateSpatialAnchors(spatialAnchors).variationPct,
               ruler,
               fitConfidence: rulerFitConfidence,
               interactionMode: canvasInteractionMode,
@@ -1723,12 +1499,18 @@ export default function FringeLab() {
               },
             },
             screenDistanceM,
-            slitWidthMm,
+            slitWidthMm: config.slitWidthKnown ? slitWidthMm : null,
             slitSeparationMm,
-            referenceWavelengthNm,
+            referenceWavelengthNm: sourceMode === "simulator" || hasReference ? referenceWavelengthNm : null,
+            parametersConfirmed,
+            slitWidthKnown,
+            sourceResolution,
+            sourceFilename,
+            captureSettings,
+            inputUncertainty: { apertureUncertaintyMm, distanceUncertaintyM, calibrationUncertaintyPct, coverageFactor: 1.96, excludes: ["ISP nonlinearity", "unknown optical geometry", "ruler/screen depth mismatch"] },
             showModelFit,
           },
-          result: analysis,
+          result: analysis.measurementReady ? analysis : { ...analysis, axisMm: null, centralPositionMm: null, peaks: analysis.peaks.map((mark) => ({ ...mark, positionMm: null })), troughs: analysis.troughs.map((mark) => ({ ...mark, positionMm: null })) },
         },
         null,
         2,
@@ -1753,6 +1535,7 @@ export default function FringeLab() {
       mmPerPixel,
       calibrationSource,
       calibrationStale,
+      spatialAnchors, hasReference, slitWidthKnown, parametersConfirmed,
       ruler,
       rulerFitConfidence,
       rulerDetection,
@@ -1789,6 +1572,10 @@ export default function FringeLab() {
       if (typeof value.slitWidthMm === "number") setSlitWidthMm(value.slitWidthMm);
       if (typeof value.slitSeparationMm === "number") setSlitSeparationMm(value.slitSeparationMm);
       if (typeof value.referenceWavelengthNm === "number") setReferenceWavelengthNm(value.referenceWavelengthNm);
+      if (typeof value.hasReference === "boolean") setHasReference(value.hasReference);
+      if (typeof value.slitWidthKnown === "boolean") setSlitWidthKnown(value.slitWidthKnown);
+      setParametersConfirmed(false);
+      setSpatialAnchors([]);
       if (typeof value.apertureUncertaintyMm === "number") setApertureUncertaintyMm(value.apertureUncertaintyMm);
       if (typeof value.distanceUncertaintyM === "number") setDistanceUncertaintyM(value.distanceUncertaintyM);
       if (typeof value.calibrationUncertaintyPct === "number") setCalibrationUncertaintyPct(value.calibrationUncertaintyPct);
@@ -1804,10 +1591,7 @@ export default function FringeLab() {
       setCalibrationSource(restoredCalibrationSource);
       const physicalRulerCalibration = restoredCalibrationSource === "physical-ruler-overlay" ||
         restoredCalibrationSource === "physical-ruler-perspective";
-      setCalibrationStale(
-        (typeof value.calibrationStale === "boolean" && value.calibrationStale) ||
-        physicalRulerCalibration,
-      );
+      setCalibrationStale(true);
       if (physicalRulerCalibration) setRulerDetectionState("stale");
       if (typeof value.rulerFitConfidence === "number") setRulerFitConfidence(value.rulerFitConfidence);
       if (typeof value.twoPointDistanceMm === "number" && value.twoPointDistanceMm > 0) setTwoPointDistanceMm(value.twoPointDistanceMm);
@@ -1874,6 +1658,8 @@ export default function FringeLab() {
     setSlitSeparationMm(0.25);
     setRoi(DEFAULT_ROI);
     setBackground(null);
+    setSpatialAnchors([]);
+    setDraftAnchors([]);
     setSourceMode("simulator");
     setSimSeed((seed) => seed + 1);
   };
@@ -1889,21 +1675,21 @@ export default function FringeLab() {
     : levelFor(analysis.fresnelNumber, 0.1, 0.25);
   const cameraCapabilityText = cameraSnapshot
     ? `${cameraSnapshot.settings.width ?? "?"}×${cameraSnapshot.settings.height ?? "?"}`
-    : sourceMode === "simulator" ? "960×540" : "未连接";
+    : sourceMode === "simulator" ? "960×540" : sourceResolution;
   const hasManualExposure = Boolean(cameraSnapshot?.capabilities.exposureMode?.includes("manual"));
   const calibrationSourceLabel = calibrationStale
     ? "STALE"
     : calibrationSource === "physical-ruler-perspective"
       ? "RULER H"
-      : calibrationSource === "physical-ruler-overlay" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
+      : calibrationSource === "multi-point" ? "LOCAL SCALE" : calibrationSource === "physical-ruler-overlay" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
   const currentRulerLengthPx = rulerLengthPx(ruler);
   const currentRulerScale = rulerMmPerPixel(ruler);
   const rulerCanApply = Number.isFinite(currentRulerLengthPx) &&
     currentRulerLengthPx >= MIN_RULER_LENGTH_PX && currentRulerScale != null &&
-    ((rulerDetection?.fit.confidence ?? 1) >= 0.55 || lowConfidenceConfirmed);
-  const rulerSourceReady = sourceMode === "image"
+    (!rulerDetection || lowConfidenceConfirmed);
+  const rulerSourceReady = !imageLoading && (sourceMode === "image"
     ? imageLoaded
-    : sourceMode === "camera" ? cameraSnapshot != null : false;
+    : sourceMode === "camera" ? cameraSnapshot != null : false);
   const rulerDetectionStatusLabel = calibrationStale || rulerDetectionState === "stale"
     ? "已失效"
     : rulerDetectionState === "detecting" ? "识别中"
@@ -1958,14 +1744,14 @@ export default function FringeLab() {
                   onClick={() => fileInputRef.current?.click()}
                   aria-controls="image-file-input"
                 >
-                  图片
+                    {imageLoading ? "解码中…" : "图片"}
                 </button>
                 <input
                   ref={fileInputRef}
                   id="image-file-input"
                   className="source-file-input"
                   type="file"
-                  accept="image/png,image/jpeg,image/webp"
+                  accept="image/png,image/jpeg,image/webp,image/heic,image/heif,.heic,.HEIC,.heif"
                   onChange={handleImageUpload}
                   tabIndex={-1}
                 />
@@ -2008,13 +1794,27 @@ export default function FringeLab() {
                   <div className="micro-card-value"><span>{formatNumber(analysis?.dynamicRange ?? null, 1)} DN</span><span>SAT {formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%</span></div>
                 </div>
               </div>
+              {sourceMode !== "simulator" ? (
+                <section className="real-setup" aria-label="实测参数">
+                  <div className="control-title-row"><h3>实测流程</h3><span className="control-index">d / L → 尺标 → 结果</span></div>
+                  <div className="field-grid">
+                    <FieldNumber label={experiment === "double" ? "双缝中心距 d" : "单缝宽度 a"} value={experiment === "double" ? slitSeparationMm : slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={(value) => { if (experiment === "double") setSlitSeparationMm(value); else setSlitWidthMm(value); setParametersConfirmed(false); }} />
+                    <FieldNumber label="缝到屏距离 L" value={screenDistanceM} unit="m" min={0.01} step={0.001} onChange={(value) => { setScreenDistanceM(value); setParametersConfirmed(false); }} />
+                  </div>
+                  <div className="button-row space-top-sm">
+                    <button type="button" className={`button ${parametersConfirmed ? "" : "primary"}`} onClick={() => setParametersConfirmed(true)} disabled={!(screenDistanceM > 0 && (experiment === "double" ? slitSeparationMm : slitWidthMm) > 0)}>{parametersConfirmed ? "参数已确认" : "确认实测参数"}</button>
+                    <span className="ruler-footnote">{parametersConfirmed ? "已使用你填写的器材数据。" : "默认值不是实测值，请填写并确认。"} {calibrationStale ? "当前尺标待标定。" : "当前尺标有效。"}</span>
+                  </div>
+                  <div className="ruler-footnote">载入或拍摄条纹与同平面的真实尺 → 选取不含尺子的条纹 ROI → 完成尺标。摄像头移动、变焦或改变分辨率后请重新标定。原图分析：{sourceResolution}。</div>
+                </section>
+              ) : null}
               <details
                 className={`ruler-fit-panel ${rulerDetectionState}`}
                 open={sourceMode !== "simulator" && rulerPanelOpen}
                 onToggle={(event) => setRulerPanelOpen(event.currentTarget.open)}
               >
                 <summary>
-                  <span><strong>标尺套合</strong><small>RULER FIT</small></span>
+                  <span><strong>标尺套合</strong><small>RULER FIT / LOCAL SCALE</small></span>
                   <span className={`ruler-state ${rulerDetectionState}`}>{sourceMode === "simulator" ? "无需标定" : rulerDetectionStatusLabel}</span>
                 </summary>
                 <div className="ruler-fit-body">
@@ -2033,8 +1833,27 @@ export default function FringeLab() {
                       </button>
                       <button type="button" className="button" disabled={!rulerSourceReady || rulerDetectionState === "detecting"} onClick={startRulerRegionSelection} title="Select Ruler Region">框选实物尺</button>
                       <button type="button" className={`button ${rulerMode && !rulerDetection ? "warn" : ""}`} disabled={!rulerSourceReady || rulerDetectionState === "detecting"} onClick={toggleRulerFit}>手动套合</button>
+                      <button type="button" className="button" disabled={!rulerSourceReady || rulerDetectionState === "detecting"} onClick={startMultiPointCalibration}>多点局部标定</button>
+                      <button type="button" className="button" disabled={!rulerSourceReady || ocrBusy || rulerDetectionState === "detecting"} onClick={runRulerOcr}>{ocrBusy ? "OCR 识别中…" : "识别尺上数字（OCR）"}</button>
                       {rulerDetectionState === "detecting" ? <button type="button" className="button danger" onClick={cancelRulerDetection}>取消识别</button> : null}
                     </div>
+                    <div className="ruler-options">
+                      <label><span>真实尺数字单位</span><select value={rulerUnit} onChange={(event) => setRulerUnit(event.currentTarget.value as "cm" | "mm")}><option value="cm">cm（数字 1 = 10 mm）</option><option value="mm">mm（数字 1 = 1 mm）</option></select></label>
+                    </div>
+                    {ocrMessage ? <div className="notice warn" role="status">{ocrMessage}</div> : null}
+                    {canvasInteractionMode === "multi-point-calibration" ? (
+                      <div className="local-calibration">
+                        <FieldNumber label="下一点真实读数" value={anchorReading} unit={rulerUnit} step={rulerUnit === "cm" ? 1 : 10} onChange={setAnchorReading} />
+                        <div className="notice space-top-sm">请点击该读数对应的刻线（不是数字中心），至少 3 点，建议覆盖整个条纹区。可跳过遮挡的刻线并修改下一读数。尺轴应与条纹变化方向平行；只校正该方向的局部比例，不是完整二维透视矫正。</div>
+                        <div className="anchor-list">{draftAnchors.map((anchor, index) => <button className="button" type="button" key={`${anchor.mm}-${index}`} title="点击删除此尺标点" onClick={() => setDraftAnchors((current) => current.filter((_, i) => i !== index))}>{anchor.mm} mm ×</button>)}</div>
+                        <div className="ruler-footnote">{validateSpatialAnchors(draftAnchors).reason} · 局部比例变化 {formatNumber(validateSpatialAnchors(draftAnchors).variationPct, 2)}%</div>
+                        <div className="button-row space-top-sm">
+                          <button type="button" className="button primary" disabled={!validateSpatialAnchors(draftAnchors).valid} onClick={applyMultiPointCalibration}>核对并应用局部尺标</button>
+                          <button type="button" className="button" onClick={() => setDraftAnchors([])}>清空候选点</button>
+                          <button type="button" className="button" onClick={() => setCanvasInteractionMode("roi")}>取消编辑</button>
+                        </div>
+                      </div>
+                    ) : spatialAnchors.length ? <div className="notice">已应用 {spatialAnchors.length} 点局部尺标，比例变化 {formatNumber(validateSpatialAnchors(spatialAnchors).variationPct, 2)}%。位置在尺标范围内分段插值；超出范围的测量不建议使用。</div> : null}
                     {rulerDetectionState === "detecting" ? (
                       <div className="ruler-progress" role="status" aria-live="polite">
                         <span style={{ width: `${rulerDetectionProgress}%` }} />
@@ -2075,12 +1894,12 @@ export default function FringeLab() {
                           <span><small>有效刻线</small>{rulerDetection ? `${rulerDetection.fit.inlierCount} / ${rulerDetection.fit.totalCount}` : "手动"}</span>
                           <span><small>平均残差</small>{rulerDetection ? `${rulerDetection.fit.residualRmsPx.toFixed(2)} px` : "—"}</span>
                           <span><small>OCR 数字</small>{rulerDetection?.numbers.length ? rulerDetection.numbers.map((item) => item.text).join(" ") : "未确认"}</span>
-                          <span><small>综合置信度</small>{rulerFitConfidence != null ? `${(rulerFitConfidence * 100).toFixed(0)}%` : "手动"}</span>
+                          <span><small>识别一致性（非精度）</small>{rulerFitConfidence != null ? `${(rulerFitConfidence * 100).toFixed(0)}%` : "手动"}</span>
                         </div>
                         {rulerDetection ? <div className="ruler-confidence">{rulerDetection.message}</div> : null}
                         {rulerDetection?.perspectiveWarning ? <div className="notice warn">{rulerDetection.perspectiveWarning}</div> : null}
-                        {rulerDetection && rulerDetection.fit.confidence < 0.55 ? (
-                          <label className="check-option low-confidence"><input type="checkbox" checked={lowConfidenceConfirmed} onChange={(event) => setLowConfidenceConfirmed(event.currentTarget.checked)} />我已人工核对刻线重合，允许应用低置信度结果</label>
+                        {rulerDetection ? (
+                          <label className="check-option low-confidence"><input type="checkbox" checked={lowConfidenceConfirmed} onChange={(event) => setLowConfidenceConfirmed(event.currentTarget.checked)} />我已核对真实区间/单位和刻线重合（排除 5 或 10 倍误判），允许应用</label>
                         ) : null}
                         <div className="button-row">
                           <button type="button" className="button" disabled={!rulerDetection} onClick={() => runPhysicalRulerDetection(rulerDetection?.selectedRegion)}>重新识别</button>
@@ -2104,9 +1923,9 @@ export default function FringeLab() {
             <div className="analysis-body">
               <div className="metric-grid">
                 <div className="metric-card primary">
-                  <div className="metric-label">测量波长 λ</div>
+                  <div className="metric-label">{analysis?.provisional && analysis.measurementReady ? "波长暂估 λ（需复测）" : "测量波长 λ"}</div>
                   <div className="metric-value">{formatNumber(analysis?.wavelengthNm ?? null, 1)}<em>nm</em></div>
-                  <div className="metric-note">95% 扩展不确定度 ± {formatNumber(analysis?.uncertaintyNm ?? null, 1)} nm</div>
+                  <div className="metric-note">{analysis?.provisional ? "过曝：不提供完整不确定度结论" : `输入误差估算（k≈1.96）± ${formatNumber(analysis?.uncertaintyNm ?? null, 1)} nm`}</div>
                 </div>
                 <div className="metric-card">
                   <div className="metric-label">{experiment === "double" ? "条纹间距 Δx" : "中央主极大 W₀"}</div>
@@ -2116,7 +1935,7 @@ export default function FringeLab() {
                 <div className="metric-card">
                   <div className="metric-label">参考值偏差</div>
                   <div className="metric-value">{formatNumber(analysis?.referenceErrorPct ?? null, 2)}<em>%</em></div>
-                  <div className="metric-note">参考 {formatNumber(referenceWavelengthNm, 0)} nm · R² {formatNumber(analysis?.regressionR2 ?? null, 4)}</div>
+                  <div className="metric-note">{sourceMode === "simulator" || hasReference ? `参考 ${formatNumber(referenceWavelengthNm, 0)} nm` : "未提供已知参考波长"} · R² {formatNumber(analysis?.regressionR2 ?? null, 4)}</div>
                 </div>
               </div>
 
@@ -2130,6 +1949,7 @@ export default function FringeLab() {
                       <input
                         type="checkbox"
                         checked={showModelFit}
+                        disabled={!config.slitWidthKnown || !analysis?.measurementReady}
                         onChange={(event) => setShowModelFit(event.currentTarget.checked)}
                       />
                       <span className={`legend-item ${showModelFit ? "" : "muted"}`}>
@@ -2147,8 +1967,10 @@ export default function FringeLab() {
                     data-model-visible={String(showModelFit)}
                   />
                 </div>
-                <div className="axis-caption"><span>归一化相机响应（a.u.，峰值≤98%）</span><span>屏面位置 / mm</span></div>
+                <div className="axis-caption"><span>归一化相机响应（a.u.，峰值≤98%）</span><span>{analysis?.measurementReady ? "屏面位置 / mm" : "待标定位置 / 原图 px"}</span></div>
               </div>
+              {analysis?.warnings.map((warning) => <div className="notice warn space-top-xs" key={warning}>{warning}</div>)}
+              {analysis ? <div className="ruler-footnote">{analysis.channelReason}。峰位采用颜色对比辅助定位；相机 DN 不是 lux，也不是绝对辐照度。</div> : null}
 
               <div className="quality-card">
                 <div className="quality-header"><span>测量质量门控</span><span>{[saturationLevel, samplingLevel, fresnelLevel].every((level) => level === "good") ? "PASS" : "CHECK"}</span></div>
@@ -2156,7 +1978,7 @@ export default function FringeLab() {
                   <QualityItem label="饱和像素" value={`${formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%`} level={saturationLevel} />
                   <QualityItem label="条纹采样" value={`${formatNumber(samplingPixels, 1)} px`} level={samplingLevel} />
                   <QualityItem label="Fraunhofer 数" value={formatNumber(analysis?.fresnelNumber ?? null, 4)} level={fresnelLevel} />
-                  <QualityItem label="空间标定" value={calibrationStale ? "需重新标定" : `${formatNumber(mmPerPixel, 5)} mm/px`} level={calibrationStale ? "warn" : mmPerPixel > 0 ? "good" : "danger"} />
+                  <QualityItem label="空间标定" value={calibrationStale ? "需重新标定" : calibrationSource === "multi-point" ? `${spatialAnchors.length} 点局部尺标` : `${formatNumber(mmPerPixel, 5)} mm/px`} level={calibrationStale ? "warn" : mmPerPixel > 0 ? "good" : "danger"} />
                   <QualityItem label="曝光锁定" value={sourceMode === "camera" ? cameraLocked ? "LOCKED" : hasManualExposure ? "AVAILABLE" : "UNAVAILABLE" : "N/A"} level={sourceMode !== "camera" || cameraLocked ? "good" : "warn"} />
                   <QualityItem label="小角差异" value={`${formatNumber(analysis?.smallAngleDifferencePct ?? null, 3)}%`} level={(analysis?.smallAngleDifferencePct ?? 0) < 0.5 ? "good" : "warn"} />
                 </div>
@@ -2169,18 +1991,27 @@ export default function FringeLab() {
           <article className="panel control-panel">
             <div className="control-title-row"><h2 className="control-title">① 光路与采集</h2><span className="control-index">SOURCE</span></div>
             <div className="segmented">
-              <button type="button" className={`segment-button ${experiment === "double" ? "active" : ""}`} onClick={() => setExperiment("double")}>双缝干涉</button>
-              <button type="button" className={`segment-button ${experiment === "single" ? "active" : ""}`} onClick={() => setExperiment("single")}>单缝衍射</button>
+              <button type="button" className={`segment-button ${experiment === "double" ? "active" : ""}`} onClick={() => { setExperiment("double"); setParametersConfirmed(false); }}>双缝干涉</button>
+              <button type="button" className={`segment-button ${experiment === "single" ? "active" : ""}`} onClick={() => { setExperiment("single"); setParametersConfirmed(false); }}>单缝衍射</button>
             </div>
             <div className="divider" />
             <div className="field-grid">
-              <FieldNumber label="缝宽 a" value={slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={setSlitWidthMm} />
-              {experiment === "double" ? <FieldNumber label="双缝中心距 d" value={slitSeparationMm} unit="mm" min={0.002} step={0.001} onChange={setSlitSeparationMm} /> : <FieldNumber label="a 标准不确定度" value={apertureUncertaintyMm} unit="mm" min={0} step={0.001} onChange={setApertureUncertaintyMm} />}
-              <FieldNumber label="缝到屏距离 L" value={screenDistanceM} unit="m" min={0.01} step={0.01} onChange={setScreenDistanceM} />
-              <FieldNumber label="标准波长（仅作对照）" value={referenceWavelengthNm} unit="nm" min={300} max={1000} step={1} onChange={setReferenceWavelengthNm} />
-              {experiment === "double" ? <FieldNumber label="d 标准不确定度" value={apertureUncertaintyMm} unit="mm" min={0} step={0.001} onChange={setApertureUncertaintyMm} /> : null}
+              {sourceMode === "simulator" ? <>
+                <FieldNumber label="缝宽 a" value={slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={setSlitWidthMm} />
+                {experiment === "double" ? <FieldNumber label="双缝中心距 d" value={slitSeparationMm} unit="mm" min={0.002} step={0.001} onChange={setSlitSeparationMm} /> : null}
+                <FieldNumber label="缝到屏距离 L" value={screenDistanceM} unit="m" min={0.01} step={0.01} onChange={setScreenDistanceM} />
+                <FieldNumber label="仿真波长" value={referenceWavelengthNm} unit="nm" min={300} max={1000} step={1} onChange={setReferenceWavelengthNm} />
+              </> : <>
+                <label className="check-option"><input type="checkbox" checked={hasReference} onChange={(event) => setHasReference(event.currentTarget.checked)} />有已知参考波长（可选）</label>
+                {hasReference ? <FieldNumber label="已知参考波长（非实测结果）" value={referenceWavelengthNm} unit="nm" min={300} max={1000} step={1} onChange={setReferenceWavelengthNm} /> : null}
+                {experiment === "double" ? <label className="check-option"><input type="checkbox" checked={slitWidthKnown} onChange={(event) => setSlitWidthKnown(event.currentTarget.checked)} />已知单缝宽 a（仅包络模型需要）</label> : null}
+                {experiment === "double" && slitWidthKnown ? <FieldNumber label="包络模型缝宽 a（可选）" value={slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={setSlitWidthMm} /> : null}
+              </>}
+              <FieldNumber label={experiment === "double" ? "d 标准不确定度（估计）" : "a 标准不确定度（估计）"} value={apertureUncertaintyMm} unit="mm" min={0} step={0.001} onChange={setApertureUncertaintyMm} />
               <FieldNumber label="L 标准不确定度" value={distanceUncertaintyM} unit="m" min={0} step={0.001} onChange={setDistanceUncertaintyM} />
             </div>
+            <div className="ruler-footnote">双缝测波长只要求 d、L 和尺标。包络模型另需 a；参考波长仅作比较，不自动假设 650 nm。输入误差估算未包含相机非线性、透视和屏面不共面等系统误差。</div>
+            {sourceMode === "simulator" ? <>
             <div className="divider" />
             <div className="button-row">
               <button type="button" className="button" onClick={() => selectPreset("double", 650)}>650 nm 双缝</button>
@@ -2193,6 +2024,7 @@ export default function FringeLab() {
               <FieldNumber label="编码 gamma" value={simGamma} min={0.3} max={3} step={0.1} onChange={setSimGamma} />
               <FieldNumber label="剪切阈值" value={simSaturation} min={0.1} max={1} step={0.02} onChange={setSimSaturation} />
             </div>
+            </> : null}
             {cameraError ? <div className="notice danger">{cameraError}</div> : null}
             <div className="button-row space-top-sm">
               <button type="button" className="button primary" onClick={startCamera}>{cameraSnapshot ? "重启摄像头" : "打开摄像头"}</button>
@@ -2215,15 +2047,15 @@ export default function FringeLab() {
             <div className="field-grid">
               <div className="field full">
                 <label htmlFor="roi-length">ROI 长度 · {Math.round(roi.width)} px</label>
-                <input id="roi-length" type="range" min={ROI_MIN_WIDTH} max={ROI_MAX_WIDTH} step={1} value={roi.width} onChange={(event) => setRoi((current) => ({ ...current, width: Number(event.currentTarget.value) }))} />
+                <input id="roi-length" type="range" min={ROI_MIN_WIDTH} max={ROI_MAX_WIDTH} step={1} value={roi.width} onChange={(event) => { const width = Number(event.currentTarget.value); setRoi((current) => ({ ...current, width })); setBackground(null); }} />
               </div>
               <div className="field full">
                 <label htmlFor="roi-thickness">ROI 厚度 · {Math.round(roi.height)} px（沿条纹平均）</label>
-                <input id="roi-thickness" type="range" min={ROI_MIN_HEIGHT} max={ROI_MAX_HEIGHT} step={1} value={roi.height} onChange={(event) => setRoi((current) => ({ ...current, height: Number(event.currentTarget.value) }))} />
+                <input id="roi-thickness" type="range" min={ROI_MIN_HEIGHT} max={ROI_MAX_HEIGHT} step={1} value={roi.height} onChange={(event) => { const height = Number(event.currentTarget.value); setRoi((current) => ({ ...current, height })); setBackground(null); }} />
               </div>
               <div className="field full">
                 <label htmlFor="roi-angle">ROI 角度 · {roi.angleDeg.toFixed(1)}°</label>
-                <input id="roi-angle" type="range" min={-30} max={30} step={0.1} value={roi.angleDeg} onChange={(event) => setRoi((current) => ({ ...current, angleDeg: Number(event.currentTarget.value) }))} />
+                <input id="roi-angle" type="range" min={-30} max={30} step={0.1} value={roi.angleDeg} onChange={(event) => { const angleDeg = Number(event.currentTarget.value); setRoi((current) => ({ ...current, angleDeg })); setBackground(null); }} />
               </div>
               <div className="field">
                 <label htmlFor="fringe-orientation">条纹方向</label>
@@ -2234,7 +2066,7 @@ export default function FringeLab() {
               </div>
               <div className="field">
                 <label htmlFor="profile-channel">分析通道</label>
-                <select id="profile-channel" value={channel} onChange={(event) => setChannel(event.currentTarget.value as RequestedProfileChannel)}>
+                <select id="profile-channel" value={channel} onChange={(event) => { setChannel(event.currentTarget.value as RequestedProfileChannel); setBackground(null); }}>
                   <option value="auto">自动最佳通道</option>
                   <option value="r">R 红通道</option>
                   <option value="g">G 绿通道</option>
@@ -2298,8 +2130,8 @@ export default function FringeLab() {
                     <tr key={`${mark.type}-${index}`}>
                       <td>{mark.type === "peak" ? mark.saturated ? "饱和峰" : "亮峰" : "暗纹"}</td>
                       <td>{mark.order ?? "—"}</td>
-                      <td>{formatNumber(mark.positionMm, 4)}</td>
-                      <td>{formatNumber(mark.value, 2)}</td>
+                      <td>{analysis?.measurementReady ? formatNumber(mark.positionMm, 4) : "待标定"}</td>
+                      <td>{mark.saturated ? "过曝无效" : formatNumber(mark.value, 2)}</td>
                       <td>{formatNumber(mark.width, 2)}</td>
                     </tr>
                   )) ?? <tr><td colSpan={5}>暂无特征</td></tr>}
