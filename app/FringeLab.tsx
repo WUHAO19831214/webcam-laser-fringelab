@@ -23,6 +23,10 @@ import { analyseFrame, type Analysis, type AnalysisConfig } from "@/lib/analysis
 import { validateSpatialAnchors, type SpatialAnchor } from "@/lib/spatial";
 import { decodeExperimentImage } from "@/lib/image-input";
 import { recognizeRulerReadings } from "@/lib/ruler-ocr";
+import { calculateFringeExercise } from "@/lib/lesson";
+import { suggestFringeRoi } from "@/lib/image-quality";
+import { TeachingGuide } from "./TeachingGuide";
+import { profileIndexForPoint, snapToBrightFringe } from "@/lib/fringe-selection";
 import {
   type FringeOrientation,
   type ImageDataLike,
@@ -77,6 +81,7 @@ type SpatialCalibrationSource =
   | "physical-ruler-perspective";
 
 type CanvasInteractionMode =
+  | "fringe-measurement"
   | "multi-point-calibration"
   | "roi"
   | "two-point-calibration"
@@ -126,10 +131,6 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
 }
 
-function finiteOr(value: number, fallback: number): number {
-  return Number.isFinite(value) ? value : fallback;
-}
-
 
 
 
@@ -168,6 +169,7 @@ function FieldNumber({
   step,
   hint,
   onChange,
+  onIncomplete,
 }: {
   label: string;
   value: number;
@@ -177,8 +179,12 @@ function FieldNumber({
   step?: number;
   hint?: string;
   onChange: (value: number) => void;
+  onIncomplete?: () => void;
 }) {
   const inputId = useId();
+  // Keep an editable string so clearing/pasting a decimal does not restore the
+  // previous number mid-keystroke or append the new text to it.
+  const [draft, setDraft] = useState({ text: String(value), value });
   return (
     <div className="field">
       <label htmlFor={inputId}>{label}</label>
@@ -186,11 +192,18 @@ function FieldNumber({
         <input
           id={inputId}
           type="number"
-          value={value}
+          value={draft.value === value ? draft.text : String(value)}
           min={min}
           max={max}
           step={step}
-          onChange={(event) => onChange(finiteOr(event.currentTarget.valueAsNumber, value))}
+          onChange={(event) => {
+            const text = event.currentTarget.value;
+            const number = text.trim() ? Number(text) : NaN;
+            setDraft({ text, value: Number.isFinite(number) ? number : value });
+            if (Number.isFinite(number)) onChange(number);
+            else onIncomplete?.();
+          }}
+          onBlur={() => setDraft({ text: String(value), value })}
         />
         {unit ? <span className="unit">{unit}</span> : null}
       </div>
@@ -239,6 +252,10 @@ export default function FringeLab() {
   const [hasReference, setHasReference] = useState(false);
   const [slitWidthKnown, setSlitWidthKnown] = useState(false);
   const [parametersConfirmed, setParametersConfirmed] = useState(false);
+  const [teachingMode, setTeachingMode] = useState(true);
+  const [answersRevealed, setAnswersRevealed] = useState(false);
+  const [lessonSelection, setLessonSelection] = useState<{ points: Point[]; geometry: string }>({ points: [], geometry: "" });
+  const [lessonIntervals, setLessonIntervals] = useState(5);
   const [sourceRevision, setSourceRevision] = useState(0);
   const [imageLoading, setImageLoading] = useState(false);
   const [sourceResolution, setSourceResolution] = useState("960×540");
@@ -260,6 +277,7 @@ export default function FringeLab() {
   const [simSeed, setSimSeed] = useState(2026);
   const [background, setBackground] = useState<number[] | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [calculationSnapshot, setCalculationSnapshot] = useState<{ key: string; result: Analysis; time: string } | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
@@ -292,6 +310,20 @@ export default function FringeLab() {
   const [showModelFit, setShowModelFit] = useState(true);
   const [toast, setToast] = useState("");
 
+  const selectionGeometry = JSON.stringify([sourceRevision, sourceMode, roi, orientation, channel, smoothingSigma]);
+  const lessonPoints = useMemo(() => lessonSelection.geometry === selectionGeometry ? lessonSelection.points : [], [lessonSelection, selectionGeometry]);
+  const setLessonPoints = (points: Point[]) => setLessonSelection({ points, geometry: selectionGeometry });
+  const sourceDimensions = sourceResolution.split("×").map(Number);
+  const nativeToDisplay = sourceMode === "simulator" ? 1 : Math.min(FRAME_WIDTH / sourceDimensions[0], FRAME_HEIGHT / sourceDimensions[1]);
+  const effectiveRevealed = answersRevealed && lessonPoints.length === 2;
+  const answersHidden = teachingMode && experiment === "double" && !effectiveRevealed;
+  const rulerPoints = spatialAnchors.length ? spatialAnchors : rulerDetection?.rulerBodyCorners ?? [];
+  const roiIncludesRuler = sourceMode !== "simulator" && rulerPoints.some((point) => isPointInsideRoi(roi, point));
+  const physicalReady = sourceMode === "simulator" || (parametersConfirmed && !calibrationStale && !imageLoading && !roiIncludesRuler);
+  const exercise = physicalReady ? calculateFringeExercise(lessonPoints, lessonIntervals, mmPerPixel, roi.angleDeg + (orientation === "horizontal" ? 90 : 0), slitSeparationMm, screenDistanceM, calibrationSource === "multi-point" ? spatialAnchors : []) : null;
+  const calculationKey = JSON.stringify([selectionGeometry, mmPerPixel, calibrationSource, spatialAnchors, screenDistanceM, slitSeparationMm, slitWidthMm, slitWidthKnown, experiment, simSeed, simNoise, simGamma, simSaturation, background, apertureUncertaintyMm, distanceUncertaintyM, calibrationUncertaintyPct]);
+  const displayedResult = physicalReady && !answersHidden && calculationSnapshot?.key === calculationKey ? calculationSnapshot.result : null;
+
   const config = useMemo<AnalysisConfig>(() => ({
     experiment,
     channel,
@@ -310,12 +342,13 @@ export default function FringeLab() {
     spatialAnchors: calibrationSource === "multi-point" ? spatialAnchors : [],
     hasReference: sourceMode === "simulator" || hasReference,
     slitWidthKnown: sourceMode === "simulator" || experiment === "single" || slitWidthKnown,
-    measurementReady: sourceMode === "simulator" || (parametersConfirmed && !calibrationStale && !imageLoading),
+    measurementReady: physicalReady,
   }), [
     experiment,
     channel,
     orientation,
     roi,
+    physicalReady,
     mmPerPixel,
     screenDistanceM,
     slitWidthMm,
@@ -326,7 +359,7 @@ export default function FringeLab() {
     referenceWavelengthNm,
     smoothingSigma,
     background,
-    spatialAnchors, calibrationSource, hasReference, slitWidthKnown, sourceMode, parametersConfirmed, calibrationStale, imageLoading,
+    spatialAnchors, calibrationSource, hasReference, slitWidthKnown, sourceMode,
   ]);
 
   const processCurrentCanvas = useCallback(() => {
@@ -517,6 +550,20 @@ export default function FringeLab() {
     }
 
     const anchors = canvasInteractionMode === "multi-point-calibration" ? draftAnchors : spatialAnchors;
+    if (lessonPoints.length) {
+      context.save();
+      context.lineWidth = 3; context.strokeStyle = "#ffec87";
+      context.beginPath(); context.moveTo(lessonPoints[0].x, lessonPoints[0].y);
+      if (lessonPoints[1]) context.lineTo(lessonPoints[1].x, lessonPoints[1].y);
+      context.stroke();
+      lessonPoints.forEach((point, index) => {
+        context.beginPath(); context.arc(point.x, point.y, 7, 0, Math.PI * 2); context.stroke();
+        context.font = "bold 15px sans-serif"; context.lineWidth = 4; context.strokeStyle = "#071019";
+        context.strokeText(index === 0 ? "A" : "B", point.x + 10, point.y - 10); context.fillStyle = "#ffec87";
+        context.fillText(index === 0 ? "A" : "B", point.x + 10, point.y - 10); context.strokeStyle = "#ffec87";
+      });
+      context.restore();
+    }
     if (anchors.length) {
       context.save();
       context.font = "bold 12px monospace";
@@ -703,7 +750,7 @@ export default function FringeLab() {
     rulerDetection,
     rulerDetectionState,
     snapHighlight,
-    draftAnchors, spatialAnchors, canvasInteractionMode,
+    draftAnchors, spatialAnchors, canvasInteractionMode, lessonPoints,
   ]);
 
   useEffect(() => {
@@ -718,12 +765,12 @@ export default function FringeLab() {
     context.scale(dpr, dpr);
     const width = rect.width;
     const height = rect.height;
-    const margins = { left: 42, right: 13, top: 13, bottom: 27 };
+    const margins = { left: 54, right: 18, top: 20, bottom: 35 };
     const plotWidth = Math.max(1, width - margins.left - margins.right);
     const plotHeight = Math.max(1, height - margins.top - margins.bottom);
     context.clearRect(0, 0, width, height);
-    context.font = "9px monospace";
-    context.fillStyle = "#607489";
+    context.font = "12px sans-serif";
+    context.fillStyle = "#93a8bc";
     context.strokeStyle = "rgba(151,184,214,.10)";
     context.lineWidth = 1;
     for (let index = 0; index <= 4; index += 1) {
@@ -734,16 +781,19 @@ export default function FringeLab() {
       context.stroke();
       context.fillText(`${Math.round(100 - index * 25)}%`, 7, y + 3);
     }
-    for (let index = 0; index <= 6; index += 1) {
-      const x = margins.left + plotWidth * index / 6;
+    const xTickCount = width < 420 ? 4 : 6;
+    for (let index = 0; index <= xTickCount; index += 1) {
+      const x = margins.left + plotWidth * index / xTickCount;
       context.beginPath();
       context.moveTo(x, margins.top);
       context.lineTo(x, margins.top + plotHeight);
       context.stroke();
       const axis = analysis.measurementReady ? analysis.axisMm : analysis.axisPx;
-      const axisIndex = Math.round((axis.length - 1) * index / 6);
-      context.fillText(formatNumber(axis[axisIndex] ?? 0, 1), x - 10, height - 7);
+      const axisIndex = Math.round((axis.length - 1) * index / xTickCount);
+      context.textAlign = index === 0 ? "left" : index === xTickCount ? "right" : "center";
+      context.fillText(formatNumber(axis[axisIndex] ?? 0, 1), x, height - 7);
     }
+    context.textAlign = "left";
     const toX = (index: number) => margins.left + index / Math.max(1, analysis.raw.length - 1) * plotWidth;
     const toY = (value: number) =>
       margins.top + (1 - clamp(value, 0, CHART_DISPLAY_CEILING)) * plotHeight;
@@ -764,7 +814,7 @@ export default function FringeLab() {
       context.setLineDash([]);
     };
     drawLine(rawNormal, "rgba(137,161,183,.35)", 1);
-    if (showModelFit && config.slitWidthKnown && analysis.measurementReady) {
+    if (showModelFit && config.slitWidthKnown && analysis.measurementReady && !answersHidden) {
       drawLine(analysis.model, "rgba(255,199,102,.82)", 1.2, [5, 4]);
     }
     drawLine(smoothNormal, "#63e6d1", 1.8);
@@ -783,7 +833,19 @@ export default function FringeLab() {
       context.lineWidth = 1.3;
       context.strokeRect(x - 2.2, y - 2.2, 4.4, 4.4);
     }
-  }, [analysis, showModelFit, config.slitWidthKnown]);
+    lessonPoints.forEach((point, index) => {
+      const sample = profileIndexForPoint(point, roi, orientation, analysis.axisPx, nativeToDisplay);
+      if (sample == null) return;
+      const x = toX(sample);
+      const y = toY(smoothNormal[Math.round(sample)] ?? 0);
+      context.strokeStyle = "#ffec87"; context.lineWidth = 1.5;
+      context.setLineDash([4, 4]); context.beginPath(); context.moveTo(x, margins.top); context.lineTo(x, margins.top + plotHeight); context.stroke(); context.setLineDash([]);
+      context.beginPath(); context.arc(x, y, 6, 0, Math.PI * 2); context.stroke();
+      context.fillStyle = "#ffec87"; context.font = "bold 13px sans-serif";
+      context.textAlign = x > width - 40 ? "right" : "left";
+      context.fillText(index === 0 ? "A" : "B", x + (x > width - 40 ? -9 : 9), Math.max(margins.top + 13, y - 9));
+    });
+  }, [analysis, showModelFit, config.slitWidthKnown, answersHidden, lessonPoints, roi, orientation, nativeToDisplay]);
 
   useEffect(() => {
     if (!toast) return;
@@ -792,6 +854,9 @@ export default function FringeLab() {
   }, [toast]);
 
   const invalidateRulerCalibrationForNewSource = () => {
+    setCalculationSnapshot(null);
+    setLessonPoints([]); setAnswersRevealed(false);
+    setRulerDetection(null);
     setCalibrationStale(true);
     setRulerDetectionState("stale");
     setBackground(null);
@@ -1054,7 +1119,7 @@ export default function FringeLab() {
   };
 
   const updateOverlayCursor = (canvas: HTMLCanvasElement, point: Point) => {
-    if (canvasInteractionMode === "multi-point-calibration" || canvasInteractionMode === "ruler-region-selection" || canvasInteractionMode === "two-point-calibration") {
+    if (canvasInteractionMode === "fringe-measurement" || canvasInteractionMode === "multi-point-calibration" || canvasInteractionMode === "ruler-region-selection" || canvasInteractionMode === "two-point-calibration") {
       canvas.style.cursor = "crosshair";
       return;
     }
@@ -1078,6 +1143,22 @@ export default function FringeLab() {
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointerPosition(event);
+    if (canvasInteractionMode === "fringe-measurement") {
+      if (!physicalReady) return;
+      if (!isPointInsideRoi(roi, point)) { setToast("请在条纹分析框内点击亮纹中心"); return; }
+      const snapped = snapToBrightFringe(point, roi, orientation, analysis?.peaks ?? [], nativeToDisplay, analysis?.periodPx ?? null);
+      if (!snapped) { setToast("附近没有可确认的亮纹峰，请靠近剖面中的局部亮峰点选"); return; }
+      if (lessonPoints.some((previous) => Math.hypot(previous.x - snapped.point.x, previous.y - snapped.point.y) < 1)) { setToast("已选择这条亮纹，请选择另一条"); return; }
+      const next = lessonPoints.length >= 2 ? [snapped.point] : [...lessonPoints, snapped.point];
+      setLessonPoints(next); setAnswersRevealed(false);
+      setCalculationSnapshot(null);
+      setToast(snapped.peak.saturated ? "已吸附到过曝亮纹的估计中心；峰顶被剪切，需降低曝光复测" : "已吸附到附近亮纹峰中心，右侧剖面同步标记");
+      if (next.length === 2) {
+        setCanvasInteractionMode("roi");
+        window.setTimeout(() => document.querySelector(".teaching-guide")?.scrollIntoView({ block: "center", behavior: "smooth" }), 120);
+      }
+      return;
+    }
     if (canvasInteractionMode === "multi-point-calibration") {
       const mm = anchorReading * (rulerUnit === "cm" ? 10 : 1);
       if (draftAnchors.some((anchor) => anchor.mm === mm)) {
@@ -1369,6 +1450,7 @@ export default function FringeLab() {
     setCalibrationSource("physical-ruler-overlay");
     setSpatialAnchors([]);
     setCalibrationStale(false);
+    setAnswersRevealed(false); setLessonPoints([]);
     setCalibrationPoints([]);
     setRulerMode(false);
     setCanvasInteractionMode("roi");
@@ -1415,6 +1497,7 @@ export default function FringeLab() {
     setSpatialAnchors(sorted);
     setCalibrationSource("multi-point");
     setCalibrationStale(false);
+    setAnswersRevealed(false); setLessonPoints([]);
     setCanvasInteractionMode("roi");
     setRulerDetectionState("applied");
     setToast(`已应用 ${sorted.length} 点局部尺标：分段插值，不是假设整个画面比例恒定`);
@@ -1511,6 +1594,13 @@ export default function FringeLab() {
             showModelFit,
           },
           result: analysis.measurementReady ? analysis : { ...analysis, axisMm: null, centralPositionMm: null, peaks: analysis.peaks.map((mark) => ({ ...mark, positionMm: null })), troughs: analysis.troughs.map((mark) => ({ ...mark, positionMm: null })) },
+          teachingObservation: experiment === "double" && lessonPoints.length ? {
+            selectedBrightCentersDisplayPx: lessonPoints, intervals: lessonIntervals,
+            calculationFromSelectedPoints: exercise,
+            formula: "spacing_mm = span_mm / intervals; wavelength_nm = 1000 * d_mm * spacing_mm / L_m",
+            note: "User-selected fringes snapped to nearby detected bright centers; clipped centers are provisional. Not an independent manual localization or a physical accuracy certificate.",
+          } : null,
+          calculationAction: displayedResult ? { triggeredAt: calculationSnapshot?.time, method: "explicit automatic regression" } : null,
         },
         null,
         2,
@@ -1664,7 +1754,19 @@ export default function FringeLab() {
     setSimSeed((seed) => seed + 1);
   };
 
-  const measureValue = experiment === "double" ? analysis?.fringeSpacingMm : analysis?.centralWidthMm;
+  const freezeLivePreview = () => {
+    if (sourceMode !== "camera") return;
+    const native = sourceCanvasRef.current;
+    const context = frameCanvasRef.current?.getContext("2d");
+    // Match the displayed optical frame to the native frame used for analysis.
+    if (native && context) drawContained(context, native, native.width, native.height);
+    setIsFrozen(true);
+  };
+  const computeAutomaticResult = () => {
+    if (!physicalReady || !analysis?.measurementReady) return;
+    freezeLivePreview();
+    setCalculationSnapshot({ key: calculationKey, result: analysis, time: new Date().toLocaleTimeString("zh-CN", { hour12: false }) });
+  };
   const samplingPixels = experiment === "double"
     ? analysis?.periodPx ?? null
     : analysis?.centralWidthMm == null ? null : analysis.centralWidthMm / mmPerPixel / 2;
@@ -1677,11 +1779,6 @@ export default function FringeLab() {
     ? `${cameraSnapshot.settings.width ?? "?"}×${cameraSnapshot.settings.height ?? "?"}`
     : sourceMode === "simulator" ? "960×540" : sourceResolution;
   const hasManualExposure = Boolean(cameraSnapshot?.capabilities.exposureMode?.includes("manual"));
-  const calibrationSourceLabel = calibrationStale
-    ? "STALE"
-    : calibrationSource === "physical-ruler-perspective"
-      ? "RULER H"
-      : calibrationSource === "multi-point" ? "LOCAL SCALE" : calibrationSource === "physical-ruler-overlay" ? "RULER FIT" : calibrationSource === "two-point" ? "2-POINT" : "MANUAL";
   const currentRulerLengthPx = rulerLengthPx(ruler);
   const currentRulerScale = rulerMmPerPixel(ruler);
   const rulerCanApply = Number.isFinite(currentRulerLengthPx) &&
@@ -1690,12 +1787,21 @@ export default function FringeLab() {
   const rulerSourceReady = !imageLoading && (sourceMode === "image"
     ? imageLoaded
     : sourceMode === "camera" ? cameraSnapshot != null : false);
-  const rulerDetectionStatusLabel = calibrationStale || rulerDetectionState === "stale"
-    ? "已失效"
-    : rulerDetectionState === "detecting" ? "识别中"
-      : rulerDetectionState === "candidate" ? "待确认"
-        : rulerDetectionState === "applied" ? "已应用"
-          : rulerDetectionState === "failed" ? "未识别" : "未识别";
+  const rulerDetectionStatusLabel = rulerDetectionState === "detecting" ? "识别中"
+    : rulerDetectionState === "candidate" ? "候选未应用"
+      : !calibrationStale ? "标定有效"
+        : rulerDetectionState === "failed" ? "请手动标定" : "尚未标定";
+  const suggestRoi = () => {
+    if (orientation === "horizontal") { setToast("横向条纹请手动调整分析框；自动选区建议目前用于近竖直彩色条纹。"); return; }
+    const canvas = sourceMode === "simulator" ? frameCanvasRef.current : sourceCanvasRef.current;
+    const context = canvas?.getContext("2d", { willReadFrequently: true });
+    if (!canvas || !context) return;
+    const suggestion = suggestFringeRoi(context.getImageData(0, 0, canvas.width, canvas.height));
+    if (!suggestion) { setToast("未找到足够清晰的彩色条纹，请手动调整分析框"); return; }
+    setRoi(suggestion); setBackground(null); setLessonPoints([]); setAnswersRevealed(false);
+    setRulerMode(false); setCalibrationMode(false); setCanvasInteractionMode("roi");
+    setToast("已建议条纹选区，请检查是否只包含亮暗条纹、避开尺子与手指。原始像素未改变。");
+  };
 
   return (
     <main className="lab-app">
@@ -1705,9 +1811,13 @@ export default function FringeLab() {
           <span className="brand-copy"><strong>FRINGELAB</strong><span>CAMERA-BASED OPTICS BENCH</span></span>
         </div>
         <div className="top-actions">
+          <div className="segmented mode-switch" aria-label="工作模式">
+            <button type="button" className={`segment-button ${teachingMode ? "active" : ""}`} onClick={() => { setTeachingMode(true); setAnswersRevealed(false); }}>教学模式</button>
+            <button type="button" className={`segment-button ${!teachingMode ? "active" : ""}`} onClick={() => setTeachingMode(false)}>分析模式</button>
+          </div>
           <span className={`status-pill ${analysis ? "good" : "warn"}`}>{analysis ? "分析引擎就绪" : "等待信号"}</span>
-          <span className={`status-pill ${analysis?.saturationRate && analysis.saturationRate > 0.02 ? "danger" : "good"}`}>
-            {analysis?.saturationRate && analysis.saturationRate > 0.02 ? "存在过曝" : "曝光可用"}
+          <span className={`status-pill ${analysis?.provisional ? "warn" : "good"}`}>
+            {analysis?.provisional ? "质量需检查" : "信号可分析"}
           </span>
           <button className="button" type="button" onClick={saveSession}>保存会话</button>
         </div>
@@ -1723,8 +1833,8 @@ export default function FringeLab() {
             </p>
           </div>
           <div className="workflow" aria-label="实验流程">
-            {["采集", "ROI", "标定", "拟合", "导出"].map((step, index) => (
-              <span className={`workflow-step ${index <= (analysis ? 3 : 1) ? "active" : ""}`} key={step}>
+            {["采集", "参数", "尺标", "计算"].map((step, index) => (
+              <span className={`workflow-step ${index === 0 || index === 1 && (sourceMode === "simulator" || parametersConfirmed) || index === 2 && !calibrationStale || index === 3 && displayedResult ? "active" : ""}`} key={step}>
                 <span className="step-index">{index + 1}</span>{step}
               </span>
             ))}
@@ -1758,6 +1868,17 @@ export default function FringeLab() {
               </div>
             </div>
             <div className="stage-body">
+              <div className="stage-toolbar">
+                <span>{canvasInteractionMode === "fringe-measurement" ? `练习：点击第 ${lessonPoints.length + 1} 个亮纹中心` : "选区只包含条纹，不包含尺子刻线"}</span>
+                <button type="button" className="button" disabled={sourceMode !== "simulator" && (!imageLoaded && !cameraSnapshot || imageLoading)} onClick={suggestRoi}>建议条纹选区</button>
+                <button type="button" className="button" onClick={() => { setRulerMode(false); setCalibrationMode(false); setCanvasInteractionMode("roi"); }}>调整分析框</button>
+              </div>
+              {sourceMode === "camera" || cameraError ? <section className="camera-input-controls" aria-label="画面输入设置">
+                <div className="field"><label htmlFor="camera-device">摄像头输入</label><select id="camera-device" value={selectedDeviceId} onChange={(event) => setSelectedDeviceId(event.currentTarget.value)}><option value="">系统默认</option>{devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</select></div>
+                <div className="button-row"><button type="button" className="button primary" onClick={startCamera}>{cameraSnapshot ? "应用 / 重启摄像头" : "打开摄像头"}</button><button type="button" className="button" disabled={!cameraSnapshot} onClick={lockCamera}>锁定可用设置</button><button type="button" className="button" disabled={!cameraSnapshot} onClick={() => { if (isFrozen) { setCalculationSnapshot(null); setLessonPoints([]); setAnswersRevealed(false); setIsFrozen(false); } else freezeLivePreview(); }}>{isFrozen ? "继续采集" : "冻结画面"}</button><button type="button" className="button danger" disabled={!cameraSnapshot} onClick={stopCamera}>断开</button></div>
+                <p className="ruler-footnote">{cameraSnapshot?.label ?? "选择视频输入后点击应用。"} {cameraSnapshot ? isFrozen ? "画面已冻结。" : "实时采集中；点选条纹或计算时冻结当前帧。" : ""}</p>
+                {cameraError ? <div className="notice danger">{cameraError}</div> : null}
+              </section> : null}
               <div className="frame-wrap">
                 <video ref={videoRef} className="hidden-video" muted playsInline />
                 <canvas ref={frameCanvasRef} className="frame-canvas" aria-label="干涉或衍射光斑帧" />
@@ -1778,32 +1899,19 @@ export default function FringeLab() {
                   <span className="hud-chip">ROI {Math.round(roi.width)}×{Math.round(roi.height)} px</span>
                   <span className="hud-chip">CH {analysis?.selectedChannel.toUpperCase() ?? channel.toUpperCase()}</span>
                 </div>
-                <div className="laser-safety">⚠ 只拍摄光屏的漫反射图样；不要让激光直接进入眼睛、摄像头或镜面反射路径。</div>
               </div>
-              <div className="stage-footer">
-                <div className="micro-card">
-                  <div className="micro-card-label">INPUT STATUS</div>
-                  <div className="micro-card-value"><span>{sourceMode === "simulator" ? "物理仿真" : sourceMode === "camera" ? cameraSnapshot?.label ?? "Camera" : "实验图片"}</span><span>{isFrozen ? "FROZEN" : "LIVE"}</span></div>
-                </div>
-                <div className="micro-card">
-                  <div className="micro-card-label">SPATIAL SCALE</div>
-                  <div className="micro-card-value"><span>{formatNumber(mmPerPixel, 5)} mm/px</span><span>{calibrationSourceLabel}</span></div>
-                </div>
-                <div className="micro-card">
-                  <div className="micro-card-label">SIGNAL RANGE</div>
-                  <div className="micro-card-value"><span>{formatNumber(analysis?.dynamicRange ?? null, 1)} DN</span><span>SAT {formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%</span></div>
-                </div>
-              </div>
+              <div className="laser-safety">⚠ 只拍摄光屏的漫反射图样；不要让激光直接进入眼睛、摄像头或镜面反射路径。</div>
               {sourceMode !== "simulator" ? (
                 <section className="real-setup" aria-label="实测参数">
-                  <div className="control-title-row"><h3>实测流程</h3><span className="control-index">d / L → 尺标 → 结果</span></div>
+                  <div className="control-title-row"><h3>1. 器材参数</h3><span className="setup-state">{parametersConfirmed ? "已应用" : "请确认当前数据"}</span></div>
                   <div className="field-grid">
-                    <FieldNumber label={experiment === "double" ? "双缝中心距 d" : "单缝宽度 a"} value={experiment === "double" ? slitSeparationMm : slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={(value) => { if (experiment === "double") setSlitSeparationMm(value); else setSlitWidthMm(value); setParametersConfirmed(false); }} />
-                    <FieldNumber label="缝到屏距离 L" value={screenDistanceM} unit="m" min={0.01} step={0.001} onChange={(value) => { setScreenDistanceM(value); setParametersConfirmed(false); }} />
+                    <FieldNumber label={experiment === "double" ? "双缝中心距 d" : "单缝宽度 a"} value={experiment === "double" ? slitSeparationMm : slitWidthMm} unit="mm" min={0.001} step={0.001} onIncomplete={() => { setParametersConfirmed(false); setAnswersRevealed(false); }} onChange={(value) => { if (experiment === "double") setSlitSeparationMm(value); else setSlitWidthMm(value); setParametersConfirmed(false); setAnswersRevealed(false); }} />
+                    <FieldNumber label="缝到屏距离 L" value={screenDistanceM} unit="m" min={0.01} step={0.001} onIncomplete={() => { setParametersConfirmed(false); setAnswersRevealed(false); }} onChange={(value) => { setScreenDistanceM(value); setParametersConfirmed(false); setAnswersRevealed(false); }} />
+                    {experiment === "double" ? <div className="field full"><label htmlFor="optional-slit-width">单个缝宽 a（可选，不是双缝间距 d）</label><div className="input-shell has-unit"><input id="optional-slit-width" type="number" min={0.001} step={0.001} placeholder="未知则留空；填写后自动启用包络模型" value={slitWidthKnown ? slitWidthMm : ""} onChange={(event) => { const value = Number(event.currentTarget.value); setSlitWidthKnown(Number.isFinite(value) && value > 0); if (Number.isFinite(value) && value > 0) setSlitWidthMm(value); }} /><span className="unit">mm</span></div><span className="field-hint">{slitWidthKnown ? `已采用 a = ${slitWidthMm} mm，无需额外勾选。` : "双缝测波长不要求 a；未填写时仅不显示包络和远场指标。"}</span></div> : null}
                   </div>
                   <div className="button-row space-top-sm">
                     <button type="button" className={`button ${parametersConfirmed ? "" : "primary"}`} onClick={() => setParametersConfirmed(true)} disabled={!(screenDistanceM > 0 && (experiment === "double" ? slitSeparationMm : slitWidthMm) > 0)}>{parametersConfirmed ? "参数已确认" : "确认实测参数"}</button>
-                    <span className="ruler-footnote">{parametersConfirmed ? "已使用你填写的器材数据。" : "默认值不是实测值，请填写并确认。"} {calibrationStale ? "当前尺标待标定。" : "当前尺标有效。"}</span>
+                    <span className="ruler-footnote">{parametersConfirmed ? "已使用你填写的器材数据。" : "点击左侧确认按钮，才会应用当前 d/L。"} {calibrationStale ? "下一步：核对并应用尺标。" : "当前尺标有效。"}</span>
                   </div>
                   <div className="ruler-footnote">载入或拍摄条纹与同平面的真实尺 → 选取不含尺子的条纹 ROI → 完成尺标。摄像头移动、变焦或改变分辨率后请重新标定。原图分析：{sourceResolution}。</div>
                 </section>
@@ -1814,10 +1922,11 @@ export default function FringeLab() {
                 onToggle={(event) => setRulerPanelOpen(event.currentTarget.open)}
               >
                 <summary>
-                  <span><strong>标尺套合</strong><small>RULER FIT / LOCAL SCALE</small></span>
+                  <span><strong>2. 标尺套合</strong><small>RULER FIT / LOCAL SCALE</small></span>
                   <span className={`ruler-state ${rulerDetectionState}`}>{sourceMode === "simulator" ? "无需标定" : rulerDetectionStatusLabel}</span>
                 </summary>
                 <div className="ruler-fit-body">
+                    <p className="calibration-help">识别或拖动只是创建候选，不会立即改变比例。核对毫米/厘米和端点刻线后，点击“应用标定”；若存在透视，建议三点以上的局部标定。</p>
                     {sourceMode === "simulator"
                       ? <div className="notice">仿真图样已有已知空间比例，无需实物标尺标定。</div>
                       : !rulerSourceReady ? <div className="notice warn">请先连接摄像头或载入实验图片，之后才能识别实物刻度尺。</div> : null}
@@ -1860,6 +1969,7 @@ export default function FringeLab() {
                         <small>正在本机分析尺体方向、边缘和毫米刻线… {rulerDetectionProgress}%</small>
                       </div>
                     ) : null}
+                    {(rulerMode || rulerDetectionState === "candidate") ? <>
                     <div className="ruler-options">
                       <label>
                         <span>显示模式</span>
@@ -1884,6 +1994,7 @@ export default function FringeLab() {
                         <span className="compact-number"><input type="number" step="1" value={manualOriginMm} onChange={(event) => { const value = Number(event.currentTarget.value); setManualOriginMm(value); setRuler((current) => ({ ...current, originMm: value })); }} /><em>mm</em></span>
                       </label>
                     </div>
+                    </> : null}
                     {(rulerDetection || rulerMode) ? (
                       <div className="ruler-console" aria-label="毫米标尺套合控制">
                         <div className="ruler-readout">
@@ -1912,32 +2023,28 @@ export default function FringeLab() {
                     <div className="ruler-footnote">刻线周期决定比例；数字只用于确认绝对起点。按住 Alt/Option 可临时关闭磁吸。刻度尺应与光屏同平面。</div>
                 </div>
               </details>
+              {teachingMode && experiment === "double" ? <TeachingGuide
+                key={`${sourceRevision}-${slitSeparationMm}-${screenDistanceM}-${calibrationSource}-${mmPerPixel}`}
+                ready={physicalReady} selecting={canvasInteractionMode === "fringe-measurement"} pointCount={lessonPoints.length}
+                intervals={lessonIntervals} exercise={exercise} revealed={effectiveRevealed} onIntervals={(value) => { setLessonIntervals(value); setAnswersRevealed(false); }}
+                dMm={slitSeparationMm} distanceM={screenDistanceM}
+                onSelect={() => { freezeLivePreview(); setLessonPoints([]); setAnswersRevealed(false); setCalculationSnapshot(null); setRulerMode(false); setCalibrationMode(false); setCanvasInteractionMode("fringe-measurement"); overlayCanvasRef.current?.scrollIntoView({block:"center",behavior:"smooth"}); }}
+                onClear={() => { setLessonPoints([]); setAnswersRevealed(false); setCalculationSnapshot(null); setCanvasInteractionMode("roi"); }} onReveal={() => { if (!answersRevealed) computeAutomaticResult(); setAnswersRevealed(!answersRevealed); }}
+              /> : null}
             </div>
           </article>
 
           <article className="panel analysis-panel">
             <div className="panel-header">
               <h2 className="panel-title">实时分析 <small>PROFILE / FIT</small></h2>
-              <span className="panel-kicker">{analysis?.status ?? "NO DATA"}</span>
+              <span className="panel-kicker">{analysis ? "剖面实时更新 · 结果需主动计算" : "等待输入画面"}</span>
             </div>
             <div className="analysis-body">
-              <div className="metric-grid">
-                <div className="metric-card primary">
-                  <div className="metric-label">{analysis?.provisional && analysis.measurementReady ? "波长暂估 λ（需复测）" : "测量波长 λ"}</div>
-                  <div className="metric-value">{formatNumber(analysis?.wavelengthNm ?? null, 1)}<em>nm</em></div>
-                  <div className="metric-note">{analysis?.provisional ? "过曝：不提供完整不确定度结论" : `输入误差估算（k≈1.96）± ${formatNumber(analysis?.uncertaintyNm ?? null, 1)} nm`}</div>
-                </div>
-                <div className="metric-card">
-                  <div className="metric-label">{experiment === "double" ? "条纹间距 Δx" : "中央主极大 W₀"}</div>
-                  <div className="metric-value">{formatNumber(measureValue ?? null, 3)}<em>mm</em></div>
-                  <div className="metric-note">{experiment === "double" ? `${analysis?.peaks.length ?? 0} 个亮峰` : `FWHM ${formatNumber(analysis?.fwhmMm ?? null, 3)} mm`}</div>
-                </div>
-                <div className="metric-card">
-                  <div className="metric-label">参考值偏差</div>
-                  <div className="metric-value">{formatNumber(analysis?.referenceErrorPct ?? null, 2)}<em>%</em></div>
-                  <div className="metric-note">{sourceMode === "simulator" || hasReference ? `参考 ${formatNumber(referenceWavelengthNm, 0)} nm` : "未提供已知参考波长"} · R² {formatNumber(analysis?.regressionR2 ?? null, 4)}</div>
-                </div>
-              </div>
+              {!physicalReady ? <div className="next-action" role="status"><strong>下一步：{!parametersConfirmed ? "应用器材参数" : roiIncludesRuler ? "把分析框移出尺子区域" : rulerDetectionState === "candidate" ? "应用已识别的尺标" : "完成当前图像的尺标"}</strong><p>{!parametersConfirmed ? "参数已填入，但尚未点击“确认实测参数”。" : roiIncludesRuler ? "尺子刻线被纳入剖面，会产生假峰。点击“建议条纹选区”，再检查框内只含条纹。" : rulerDetectionState === "candidate" ? "候选尺已经显示。请核对真实区间和刻线重合，勾选确认并点击“应用标定”。" : "手动点击已知刻线，或框选实物尺并核对自动候选后应用。"}</p></div> : answersHidden ? <div className="next-action"><strong>教学答案已遮蔽</strong><p>在左侧点选两个亮纹，计算 Δx 与 λ，再检查或揭示答案。也可切换“分析模式”。</p></div> : null}
+              <section className="compact-results" aria-label="主动计算结果" aria-live="polite">
+                <div className="result-action"><span>{displayedResult ? `${calculationSnapshot?.time} · 点击计算所得的自动结果` : answersHidden ? "教学模式：完成练习后点击揭示答案" : "尚未计算；参数或选区改变后请重新计算"}</span><button type="button" className="button primary" disabled={!physicalReady || !analysis?.measurementReady || answersHidden} onClick={computeAutomaticResult}>{displayedResult ? "重新计算" : "计算自动结果"}</button></div>
+                {displayedResult ? <><div className="result-values"><span>{displayedResult.provisional ? "波长暂估 λ" : "波长 λ"}<strong>{formatNumber(displayedResult.wavelengthNm, 1)} <small>nm</small></strong></span><span>{experiment === "double" ? "条纹间距 Δx" : "中央主极大 W₀"}<strong>{formatNumber(experiment === "double" ? displayedResult.fringeSpacingMm : displayedResult.centralWidthMm, 3)} <small>mm</small></strong></span></div><p className="ruler-footnote">{displayedResult.status}。{displayedResult.provisional ? "仅供暂估，需降低曝光复测；不提供完整不确定度。" : `输入误差估算（k≈1.96）：± ${formatNumber(displayedResult.uncertaintyNm, 1)} nm。`}这是自动回归结果，不是学生输入的计算答案。</p></> : null}
+              </section>
 
               <div className="chart-card">
                 <div className="chart-card-header">
@@ -1949,7 +2056,7 @@ export default function FringeLab() {
                       <input
                         type="checkbox"
                         checked={showModelFit}
-                        disabled={!config.slitWidthKnown || !analysis?.measurementReady}
+                        disabled={!config.slitWidthKnown || !analysis?.measurementReady || answersHidden}
                         onChange={(event) => setShowModelFit(event.currentTarget.checked)}
                       />
                       <span className={`legend-item ${showModelFit ? "" : "muted"}`}>
@@ -1962,18 +2069,27 @@ export default function FringeLab() {
                   <canvas
                     ref={chartCanvasRef}
                     className="chart-canvas"
-                    aria-label="相对光强随位置曲线"
+                    aria-label={`相对光强随位置曲线${lessonPoints.length ? `，已同步标记 ${lessonPoints.length === 2 ? "A 和 B" : "A"}` : ""}`}
                     data-display-ceiling={CHART_DISPLAY_CEILING}
-                    data-model-visible={String(showModelFit)}
+                    data-selection-count={lessonPoints.length}
+                    data-selection-profile-indices={JSON.stringify(analysis ? lessonPoints.map((point) => profileIndexForPoint(point, roi, orientation, analysis.axisPx, nativeToDisplay)) : [])}
+                    data-model-visible={String(showModelFit && !answersHidden && config.slitWidthKnown && analysis?.measurementReady)}
                   />
                 </div>
                 <div className="axis-caption"><span>归一化相机响应（a.u.，峰值≤98%）</span><span>{analysis?.measurementReady ? "屏面位置 / mm" : "待标定位置 / 原图 px"}</span></div>
+                {lessonPoints.length ? <p className="ruler-footnote profile-selection" role="status">{lessonPoints.map((point, index) => `${index === 0 ? "A" : "B"}：对应亮纹峰中心`).join(" · ")}。黄色圈和竖线与左侧选点同步；平顶峰中心为暂估。</p> : null}
               </div>
-              {analysis?.warnings.map((warning) => <div className="notice warn space-top-xs" key={warning}>{warning}</div>)}
-              {analysis ? <div className="ruler-footnote">{analysis.channelReason}。峰位采用颜色对比辅助定位；相机 DN 不是 lux，也不是绝对辐照度。</div> : null}
+              <details className="fringe-method-note"><summary>为什么选亮纹？暗纹能用吗？</summary><p>双缝小角近似下，连续同类亮纹或暗纹的间距均可用于测量。当前练习选亮纹，吸附到点击附近的局部峰中心，不跳到整幅图最亮处。过曝平顶不能确定唯一峰值，中心仅为暂估；暗纹清晰时可作为交叉核验，但不要混用亮—暗间隔，也要排除衍射包络造成的缺级。</p><p>单缝测波长采用暗纹位置，不能直接套用双缝等间距亮纹法。</p><a href="https://openstax.org/books/university-physics-volume-3/pages/3-2-mathematics-of-interference" target="_blank" rel="noreferrer">参考：OpenStax 双缝干涉理论</a></details>
+              {analysis?.provisional ? <div className="notice warn space-top-sm">部分像素饱和或位置外推：波长仍可由峰位暂估，不能恢复已剪切的峰高与宽度。请先排除尺子干扰，再降低曝光复测。</div> : null}
+              <div className="button-row export-toolbar">
+                <button type="button" className="button primary" disabled={!displayedResult} onClick={exportCsv}>导出 CSV</button>
+                <button type="button" className="button" disabled={!displayedResult} onClick={exportJson}>导出 JSON</button>
+                <button type="button" className="button" disabled={!displayedResult} onClick={exportPng}>曲线 PNG</button>
+                <button type="button" className="button" onClick={loadSession}>恢复会话</button>
+              </div>
 
-              <div className="quality-card">
-                <div className="quality-header"><span>测量质量门控</span><span>{[saturationLevel, samplingLevel, fresnelLevel].every((level) => level === "good") ? "PASS" : "CHECK"}</span></div>
+              <details className="quality-card">
+                <summary className="quality-header"><span>质量诊断与科学边界</span><span>{analysis?.provisional ? "需复测" : physicalReady ? "查看详情" : "待准备"}</span></summary>
                 <div className="quality-list">
                   <QualityItem label="饱和像素" value={`${formatNumber((analysis?.saturationRate ?? 0) * 100, 2)}%`} level={saturationLevel} />
                   <QualityItem label="条纹采样" value={`${formatNumber(samplingPixels, 1)} px`} level={samplingLevel} />
@@ -1982,11 +2098,19 @@ export default function FringeLab() {
                   <QualityItem label="曝光锁定" value={sourceMode === "camera" ? cameraLocked ? "LOCKED" : hasManualExposure ? "AVAILABLE" : "UNAVAILABLE" : "N/A"} level={sourceMode !== "camera" || cameraLocked ? "good" : "warn"} />
                   <QualityItem label="小角差异" value={`${formatNumber(analysis?.smallAngleDifferencePct ?? null, 3)}%`} level={(analysis?.smallAngleDifferencePct ?? 0) < 0.5 ? "good" : "warn"} />
                 </div>
-              </div>
+                <div className="quality-explanation">
+                  {analysis ? <p>{analysis.channelReason}。峰位采用颜色对比辅助定位；相机 DN 不是 lux。</p> : null}
+                  <p>原始通道饱和率：R {formatNumber((analysis?.saturationByChannel.r ?? 0) * 100, 2)}% · G {formatNumber((analysis?.saturationByChannel.g ?? 0) * 100, 2)}% · B {formatNumber((analysis?.saturationByChannel.b ?? 0) * 100, 2)}%。自动通道需保持与亮纹同向；降噪与显示亮度不能恢复原始剪切值。</p>
+                  {sourceMode !== "simulator" ? <p>{slitWidthKnown || experiment === "single" ? `已采用缝宽 a = ${slitWidthMm} mm。远场指标依赖孔径、距离与波长，不等于实验已经满足所有远场条件。` : "缝宽 a 留空：仍可按 d/L 测双缝波长，仅不计算包络/远场指标。可在左侧器材参数直接填写 a。"}</p> : null}
+                  {analysis?.warnings.filter((warning) => !warning.includes("请确认") && !warning.includes("缝宽 a 未知")).map((warning) => <p key={warning}>{warning}</p>)}
+                </div>
+              </details>
             </div>
           </article>
         </section>
 
+        <details className="advanced-settings">
+          <summary>专业设置与特征数据 <span>采集控制 · 选区微调 · 不确定度 · 原始数据</span></summary>
         <section className="control-deck">
           <article className="panel control-panel">
             <div className="control-title-row"><h2 className="control-title">① 光路与采集</h2><span className="control-index">SOURCE</span></div>
@@ -2004,8 +2128,7 @@ export default function FringeLab() {
               </> : <>
                 <label className="check-option"><input type="checkbox" checked={hasReference} onChange={(event) => setHasReference(event.currentTarget.checked)} />有已知参考波长（可选）</label>
                 {hasReference ? <FieldNumber label="已知参考波长（非实测结果）" value={referenceWavelengthNm} unit="nm" min={300} max={1000} step={1} onChange={setReferenceWavelengthNm} /> : null}
-                {experiment === "double" ? <label className="check-option"><input type="checkbox" checked={slitWidthKnown} onChange={(event) => setSlitWidthKnown(event.currentTarget.checked)} />已知单缝宽 a（仅包络模型需要）</label> : null}
-                {experiment === "double" && slitWidthKnown ? <FieldNumber label="包络模型缝宽 a（可选）" value={slitWidthMm} unit="mm" min={0.001} step={0.001} onChange={setSlitWidthMm} /> : null}
+                <p className="ruler-footnote">缝宽 a 可在上方器材参数直接填写，填写即启用。</p>
               </>}
               <FieldNumber label={experiment === "double" ? "d 标准不确定度（估计）" : "a 标准不确定度（估计）"} value={apertureUncertaintyMm} unit="mm" min={0} step={0.001} onChange={setApertureUncertaintyMm} />
               <FieldNumber label="L 标准不确定度" value={distanceUncertaintyM} unit="m" min={0} step={0.001} onChange={setDistanceUncertaintyM} />
@@ -2025,21 +2148,6 @@ export default function FringeLab() {
               <FieldNumber label="剪切阈值" value={simSaturation} min={0.1} max={1} step={0.02} onChange={setSimSaturation} />
             </div>
             </> : null}
-            {cameraError ? <div className="notice danger">{cameraError}</div> : null}
-            <div className="button-row space-top-sm">
-              <button type="button" className="button primary" onClick={startCamera}>{cameraSnapshot ? "重启摄像头" : "打开摄像头"}</button>
-              <button type="button" className="button" disabled={!cameraSnapshot} onClick={lockCamera}>锁定可用设置</button>
-              <button type="button" className="button danger" disabled={!cameraSnapshot} onClick={stopCamera}>断开</button>
-            </div>
-            {devices.length > 0 ? (
-              <div className="field space-top-sm">
-                <label htmlFor="camera-device">视频输入</label>
-                <select id="camera-device" value={selectedDeviceId} onChange={(event) => setSelectedDeviceId(event.currentTarget.value)}>
-                  <option value="">系统默认</option>
-                  {devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}
-                </select>
-              </div>
-            ) : null}
           </article>
 
           <article className="panel control-panel">
@@ -2130,7 +2238,7 @@ export default function FringeLab() {
                     <tr key={`${mark.type}-${index}`}>
                       <td>{mark.type === "peak" ? mark.saturated ? "饱和峰" : "亮峰" : "暗纹"}</td>
                       <td>{mark.order ?? "—"}</td>
-                      <td>{analysis?.measurementReady ? formatNumber(mark.positionMm, 4) : "待标定"}</td>
+                      <td>{answersHidden ? "教学遮蔽" : analysis?.measurementReady ? formatNumber(mark.positionMm, 4) : "待标定"}</td>
                       <td>{mark.saturated ? "过曝无效" : formatNumber(mark.value, 2)}</td>
                       <td>{formatNumber(mark.width, 2)}</td>
                     </tr>
@@ -2139,12 +2247,7 @@ export default function FringeLab() {
               </table>
             </div>
             <div className="divider" />
-            <div className="button-row">
-              <button type="button" className="button primary" disabled={!analysis} onClick={exportCsv}>导出 CSV</button>
-              <button type="button" className="button" disabled={!analysis} onClick={exportJson}>导出 JSON</button>
-              <button type="button" className="button" disabled={!analysis} onClick={exportPng}>曲线 PNG</button>
-              <button type="button" className="button" onClick={loadSession}>恢复会话</button>
-            </div>
+            <p className="ruler-footnote">导出功能在右上结果面板；教学模式需揭示答案，分析模式需点击计算后使用。</p>
             <div className="divider" />
             <details className="notice">
               <summary>本项目究竟测量什么？</summary>
@@ -2156,6 +2259,7 @@ export default function FringeLab() {
             </details>
           </article>
         </section>
+        </details>
 
         <footer className="footer-note">
           <span>FringeLab · 数据默认仅在当前浏览器处理，摄像头帧不上传。</span>

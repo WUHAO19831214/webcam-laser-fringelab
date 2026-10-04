@@ -57,3 +57,9 @@ test("multi-point ruler maps a changing local scale rather than one global scale
   assert.equal(validateSpatialAnchors(anchors.slice(0, 2)).valid, false);
   assert.equal(validateSpatialAnchors([{ x: 0, y: 0, mm: 0 }, { x: 60, y: 45, mm: 10 }, { x: 100, y: 0, mm: 20 }]).valid, false);
 });
+
+test("explicitly supplied slit width enables the model without an unknown-width warning", () => {
+  const analysis = analyseFrame(redFringes(), { ...config, slitWidthKnown: true, slitWidthMm: .04 });
+  assert.ok(analysis.fresnelNumber != null);
+  assert.ok(!analysis.warnings.some((warning) => warning.includes("缝宽 a 未知")));
+});

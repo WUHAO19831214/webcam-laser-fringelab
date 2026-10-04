@@ -22,6 +22,9 @@
   --radius-lg: 22px;
   --radius-md: 15px;
   --shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+  --type-body: 1rem;
+  --type-small: .875rem;
+  --type-title: 1.125rem;
 }
 
 * {
@@ -60,6 +63,11 @@ button {
   min-height: 100vh;
   overflow: hidden;
 }
+
+/* Local teaching redesign: readable Chinese text and progressive disclosure. */
+body { font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; font-size: var(--type-body); line-height: 1.6; }
+button, input, select { font-size: 1rem; }
+:root { --muted: #acbdcd; --faint: #93a8bc; --radius-lg: 18px; }
 
 .lab-app::before {
   position: fixed;
@@ -1243,6 +1251,87 @@ details p {
   border: 0;
 }
 
+/* Task hierarchy overrides the old dense instrument-dashboard type scale. */
+.app-shell { width: min(1680px, 100%); }
+.intro-strip h1 { font-size: clamp(26px, 2.1vw, 36px); line-height: 1.35; }
+.intro-strip p { font-size: 1rem; max-width: 900px; }
+.workspace-grid { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: start; gap: 24px; }
+.panel-title, .control-title, .real-setup h3, .teaching-guide h3 { font-size: 1.125rem; font-weight: 650; }
+.panel-title small, .control-index, .panel-kicker, .eyebrow { font-size: .75rem; letter-spacing: .05em; }
+.panel-header { padding: 16px 20px; gap: 12px; flex-wrap: wrap; }
+.panel-kicker { color: var(--muted); max-width: 100%; overflow-wrap: anywhere; }
+.button, .source-tab, .segment-button { font-size: .9375rem; min-height: 44px; padding: 10px 14px; }
+.source-tabs { flex-shrink: 0; }
+.field label, .field-hint, .ruler-footnote, .ruler-confidence, .ruler-options, .ruler-manual-grid, .notice, .check-option { font-size: .9375rem; line-height: 1.65; }
+.field input:not([type="range"]), .field select, .compact-number input, .ruler-options select { min-height: 46px; font-size: 1rem; }
+.unit, .micro-card-label, .micro-card-value > span:last-child, .metric-note, .metric-label, .axis-caption, .quality-item, .quality-header, .results-table, .ruler-state, .footer-note, .status-pill { font-size: .875rem; }
+.micro-card-value, .ruler-readout { font-size: 1rem; }
+.micro-card-value { flex-wrap: wrap; }
+.metric-grid { gap: 12px; }
+.metric-card { padding: 16px 12px; }
+.metric-value { font-size: clamp(24px, 2.3vw, 34px); line-height: 1.5; }
+.metric-value em { font-size: .875rem; }
+.metric-note { line-height: 1.6; white-space: normal; overflow: visible; text-overflow: clip; }
+.chart-card-title { font-size: 1rem; }
+.chart-legend, .legend-item, .model-toggle { font-size: .8125rem; }
+.chart-card-header { align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+.chart-wrap { height: 330px; }
+.quality-header { cursor: pointer; padding: 16px; }
+.quality-item { min-height: 48px; padding: 12px; }
+.quality-explanation { padding: 4px 16px 16px; font-size: .9375rem; color: var(--muted); }
+.quality-explanation p { margin: 12px 0 0; }
+.hud-chip, .laser-safety { font-size: .75rem; }
+.frame-hud { pointer-events: none; }
+.stage-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; font-size: .875rem; color: var(--muted); }
+.stage-toolbar > span { flex: 1 1 220px; }
+.real-setup, .teaching-guide { border: 1px solid var(--line-strong); border-radius: 14px; padding: 18px; margin-top: 18px; background: rgba(99,230,209,.025); }
+.setup-state, .lesson-badge { font-size: .8125rem; color: var(--cyan); }
+.ruler-fit-panel { margin-top: 18px; }
+.ruler-fit-panel > summary strong { font-size: 1.125rem; }
+.ruler-fit-panel > summary small { font-size: .75rem; }
+.ruler-fit-body { padding: 18px; }
+.ruler-readout small { font-size: .8125rem; }
+.ruler-progress small { font-size: .875rem; }
+.calibration-help { color: var(--muted); margin: 0 0 16px; font-size: .9375rem; }
+.next-action { border-left: 3px solid var(--cyan); padding: 14px 16px; margin-bottom: 18px; background: var(--cyan-soft); border-radius: 8px; font-size: .9375rem; }
+.next-action p { margin: 5px 0 0; color: var(--muted); }
+.export-toolbar { margin: 18px 0; }
+.advanced-settings { margin-top: 24px; border: 1px solid var(--line-strong); border-radius: 14px; padding: 18px; }
+.advanced-settings > summary { cursor: pointer; font-weight: 600; font-size: 1.125rem; }
+.advanced-settings > summary span { display: block; font-size: .875rem; font-weight: 400; color: var(--muted); margin-top: 4px; }
+.control-deck { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
+.control-deck > article:last-child { grid-column: 1 / -1; }
+.control-panel { box-shadow: none; }
+.lesson-steps { padding-left: 22px; margin: 0 0 18px; font-size: .9375rem; color: var(--muted); }
+.lesson-steps li { margin: 8px 0; }
+.lesson-steps strong { color: var(--text); }
+.lesson-status { margin: 12px 0 0; font-size: .875rem; color: var(--muted); }
+.lesson-observation { padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; font-size: .875rem; }
+.lesson-observation strong { font-size: 1.25rem; }
+.lesson-observation small { display: block; color: var(--muted); font-size: .8125rem; }
+.lesson-answer { margin-top: 16px; padding: 16px; border-radius: 10px; background: var(--cyan-soft); font-size: .9375rem; }
+.button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
+@media (min-width: 1101px) { .analysis-panel { position: sticky; top: 90px; } }
+@media (max-width: 1100px) { .workspace-grid { grid-template-columns: 1fr; } }
+@media (max-width: 680px) {
+  .topbar { position: static; padding: 12px; flex-wrap: wrap; gap: 10px; }
+  .top-actions { flex-wrap: wrap; width: 100%; }
+  .mode-switch { flex: 1; }
+  .mode-switch .segment-button { flex: 1; }
+  .workspace-grid, .control-deck { grid-template-columns: 1fr; }
+  .panel-header { padding: 16px; }
+  .metric-grid { grid-template-columns: 1fr; }
+  .metric-card { padding: 14px; }
+  .metric-value { font-size: 28px; }
+  .metric-card .metric-note { margin-top: 0; }
+  .chart-wrap { height: 280px; }
+  .real-setup, .teaching-guide, .ruler-fit-body { padding: 14px; }
+  .laser-safety { position: static; max-width: none; border-radius: 0; }
+  .frame-wrap { padding-bottom: 0; }
+  .quality-list { grid-template-columns: 1fr; }
+  .quality-item:nth-child(2n) { border-left: 0; }
+}
+
 @media (max-width: 1280px) {
   .workspace-grid {
     grid-template-columns: minmax(0, 1.25fr) minmax(380px, 0.9fr);
@@ -1411,4 +1500,68 @@ details p {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Keep the teaching layout and laser notice readable after legacy breakpoints. */
+@media (max-width: 1100px) { .workspace-grid { grid-template-columns: 1fr; } }
+@media (max-width: 680px) {
+  .laser-safety { display: block; position: static; max-width: none; font-size: .75rem; }
+  .stage-body, .analysis-body { padding: 14px; }
+  .metric-grid { grid-template-columns: 1fr; }
+  .topbar { padding: 12px; }
+}
+
+.laser-safety { position: static; display: block; max-width: none; margin: 10px 0 0; font-size: .875rem; }
+@media (max-width: 680px) {
+  .frame-hud .hud-chip:not(:nth-child(2)) { display: none; }
+  .panel-title small, .ruler-fit-panel > summary small { display: none; }
+  .laser-safety { font-size: .8125rem; border-radius: 8px; }
+}
+.camera-input-controls, .compact-results, .calculator-panel, .fringe-method-note {
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border, #2c4050);
+  border-radius: 14px;
+  background: rgba(15, 29, 41, .55);
+}
+.camera-input-controls .field { margin-bottom: 12px; }
+.compact-results { padding: 14px 16px; }
+.result-action { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.result-action > span { font-size: 14px; color: #a8bdcc; }
+.result-action .button { flex-shrink: 0; }
+.result-values { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+.result-values > span { font-size: 14px; color: #a8bdcc; }
+.result-values strong { display: block; color: #edf5fb; font-size: 26px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.result-values small { font-size: 14px; font-weight: 400; }
+.calculator-panel { margin-top: 18px; }
+.calculator-panel h3 { margin: 0; font-size: 17px; }
+.calculator-keys { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.calculator-output { display: block; min-height: 48px; padding: 12px 0; font-size: 20px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.fringe-method-note { margin-top: 16px; font-size: 14px; line-height: 1.7; color: #b9cbd8; }
+.fringe-method-note summary { cursor: pointer; }
+.fringe-method-note a { color: #63e6d1; }
+.profile-selection { color: #ffec87; }
+@media (max-width: 560px) { .result-action { align-items: stretch; flex-direction: column; } }
+.lesson-heading { flex-wrap: wrap; align-items: center; }
+.lesson-heading h3 { margin: 0; }
+.lesson-heading-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-left: auto; }
+.calculator-floating {
+  position: fixed;
+  z-index: 100;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 100px);
+  overflow-y: auto;
+  margin: 0;
+  background: #101f2b;
+  border-color: #537684;
+  box-shadow: 0 16px 60px rgba(0,0,0,.6);
+}
+.calculator-floating .control-title-row { gap: 8px; margin-bottom: 10px; }
+.calculator-floating .ruler-footnote { font-size: 13px; line-height: 1.5; }
+.calculator-floating .calculator-keys { gap: 6px; }
+.calculator-floating .button { padding: 8px 10px; }
+@media (max-width: 719px) {
+  .calculator-floating { left: 16px !important; top: auto !important; bottom: 16px; width: calc(100vw - 32px); max-height: calc(100dvh - 32px); }
+  .lesson-heading-actions { gap: 8px; }
 }

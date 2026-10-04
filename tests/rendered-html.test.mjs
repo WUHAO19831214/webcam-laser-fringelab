@@ -26,6 +26,9 @@ test("server-renders the finished FringeLab experiment bench", async () => {
   assert.match(html, /FRINGELAB/);
   assert.match(html, /把光屏上的条纹/);
   assert.match(html, /相对光强剖面/);
+  assert.match(html, /计算自动结果/);
+  assert.match(html, /打开计算器/);
+  assert.doesNotMatch(html, /参考值偏差|class="stage-footer"/);
   assert.match(html, /峰值≤98%/);
   assert.match(html, /理想模型拟合/);
   assert.match(html, /拖动四角方块调整长宽/);

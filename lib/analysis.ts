@@ -455,7 +455,7 @@ export function analyseFrame(image: ImageDataLike, config: AnalysisConfig): Anal
         ? null
         : Math.abs(wavelengthNm - smallAngleNm) / wavelengthNm * 100,
     regressionR2,
-    fresnelNumber,
+    fresnelNumber: measurementReady ? fresnelNumber : null,
     centralPositionMm,
     status: !measurementReady ? "待确认参数与尺标" : provisional ? `暂估（质量降级）· ${status}` : status,
   };
